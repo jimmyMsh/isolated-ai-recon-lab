@@ -1,0 +1,9 @@
+# Force LF line endings for shell scripts (they run on Linux, not Windows)
+*.sh text eol=lf
+
+# Markdown and config files — LF for consistency
+*.md text eol=lf
+*.xml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
