@@ -221,6 +221,8 @@ bash infra/03-attacker-post-install.sh
 
 Installs: `nmap`, `nikto`, `snmp`, `netcat-openbsd`, `curl`, `dnsutils`, `whois`, `tcpdump`, `tmux`, Python dev tools, and `iptables-persistent`.
 
+> **Note:** `enum4linux` is unavailable in Ubuntu 24.04 repos. Install `enum4linux-ng` via pip if needed.
+
 ---
 
 ### Step 4 — Create the Target VM (Host)
@@ -309,7 +311,7 @@ Expected results:
 bash infra/08-take-snapshot.sh
 ```
 
-Takes external, disk-only snapshots of both VMs for easy rollback. UEFI-safe (uses `--disk-only --atomic`).
+Takes external, disk-only snapshots of both VMs for easy rollback. External disk-only snapshots are required because internal snapshots do not support UEFI firmware VMs in libvirt. Uses `--disk-only --atomic`.
 
 Revert later with:
 ```bash
