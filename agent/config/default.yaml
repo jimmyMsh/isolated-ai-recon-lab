@@ -1,0 +1,47 @@
+# Dark Agents — Runtime Configuration
+# Override ollama_url at runtime: OLLAMA_URL=http://x.x.x.x:11434
+
+ollama_url: "http://192.168.1.182:11434"
+model: "qwen3:8b"
+num_ctx: 8192
+target_subnet: "192.168.56.0/24"
+attacker_ip: "192.168.56.10"
+nmap_path: "/usr/bin/nmap"
+output_dir: "./output"
+
+allowed_tools:
+  - "nmap"
+
+pipeline_stages:
+  - "host_discovery"
+  - "port_scan"
+  - "service_enum"
+  - "os_fingerprint"
+
+max_total_duration_seconds: 600
+
+# Per-stage defaults (override per stage below)
+default_stage:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 20
+  timeout_seconds: 120
+  max_retries: 2
+  think: false
+
+# Per-stage overrides (merged with default_stage)
+stage_configs:
+  host_discovery:
+    timeout_seconds: 60
+  port_scan:
+    timeout_seconds: 180
+  service_enum:
+    timeout_seconds: 180
+  os_fingerprint:
+    timeout_seconds: 120
+
+# Interpretation call parameters (separate from planning)
+interpretation:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
