@@ -25,3 +25,16 @@ venv/
 
 # Logs
 *.log
+
+# Agent runtime output (logs, nmap XML, pcaps, reports)
+agent/output/*
+!agent/output/.gitkeep
+
+# Python tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv cache (uv.lock IS committed for reproducibility)
+.uv/
