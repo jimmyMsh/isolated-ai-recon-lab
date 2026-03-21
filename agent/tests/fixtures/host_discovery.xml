@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sn 192.168.56.0/24" start="1710000000">
+  <host>
+    <status state="up" reason="arp-response"/>
+    <address addr="192.168.56.1" addrtype="ipv4"/>
+    <address addr="52:54:00:00:00:01" addrtype="mac"/>
+    <hostnames/>
+  </host>
+  <host>
+    <status state="up" reason="arp-response"/>
+    <address addr="192.168.56.101" addrtype="ipv4"/>
+    <address addr="52:54:00:DA:01:01" addrtype="mac"/>
+    <hostnames>
+      <hostname name="metasploitable.localdomain" type="PTR"/>
+    </hostnames>
+  </host>
+  <host>
+    <status state="down" reason="no-response"/>
+    <address addr="192.168.56.200" addrtype="ipv4"/>
+  </host>
+</nmaprun>
