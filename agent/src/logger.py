@@ -51,6 +51,10 @@ class AgentLogger:
         Path(config.log_file).parent.mkdir(parents=True, exist_ok=True)
         self._file: TextIO = open(config.log_file, "a")  # noqa: SIM115
 
+    @property
+    def trace_id(self) -> str:
+        return self._trace_id
+
     def log_event(
         self,
         event_type: str,

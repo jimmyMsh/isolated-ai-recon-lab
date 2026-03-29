@@ -574,3 +574,22 @@ class TestErrorProvenance:
         last = events[-1]
         assert last["event_type"] == "state_update"
         assert "error_type" not in last
+
+
+# ---------------------------------------------------------------------------
+# trace_id property
+# ---------------------------------------------------------------------------
+
+
+class TestTraceIdProperty:
+    def test_trace_id_property_exposed(self, logger):
+        assert re.match(r"^run_\d{8}_\d{6}_\d+$", logger.trace_id)
+
+    def test_trace_id_matches_logged_events(self, logger, config):
+        logger.log_event("planning_call", "host_discovery", {})
+        event = _read_events(config)[0]
+        assert logger.trace_id == event["trace_id"]
+
+    def test_trace_id_is_readonly(self, logger):
+        with pytest.raises(AttributeError):
+            logger.trace_id = "x"
