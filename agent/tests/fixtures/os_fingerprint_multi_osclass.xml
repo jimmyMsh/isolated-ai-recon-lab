@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -O --osscan-guess 192.168.56.101" start="1710000000">
+  <host>
+    <status state="up" reason="arp-response"/>
+    <address addr="192.168.56.101" addrtype="ipv4"/>
+    <os>
+      <portused state="open" proto="tcp" portid="22"/>
+      <osmatch name="Linux 2.6.9 - 2.6.33" accuracy="95" line="52451">
+        <osclass type="general purpose" vendor="Linux" osfamily="Linux" osgen="2.6.X" accuracy="95">
+          <cpe>cpe:/o:linux:linux_kernel:2.6</cpe>
+        </osclass>
+        <osclass type="WAP" vendor="Linux" osfamily="Linux" osgen="2.6.X" accuracy="95">
+          <cpe>cpe:/o:linux:linux_kernel:2.6</cpe>
+          <cpe>cpe:/h:linksys:wrt54g</cpe>
+        </osclass>
+      </osmatch>
+    </os>
+  </host>
+</nmaprun>

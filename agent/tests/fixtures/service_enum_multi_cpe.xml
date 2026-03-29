@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sV -p 22,80 192.168.56.101" start="1710000000">
+  <host>
+    <status state="up" reason="arp-response"/>
+    <address addr="192.168.56.101" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="4.7p1" extrainfo="Debian 8ubuntu1" method="probed" conf="10">
+          <cpe>cpe:/a:openbsd:openssh:4.7p1</cpe>
+          <cpe>cpe:/o:linux:linux_kernel</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+</nmaprun>

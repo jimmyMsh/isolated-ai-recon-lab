@@ -91,7 +91,6 @@ class NmapParser:
             if svc is None:
                 continue
 
-            cpe_el = svc.find("cpe")
             services.append(
                 {
                     "port": int(port_el.get("portid", "0")),
@@ -100,7 +99,7 @@ class NmapParser:
                     "product": svc.get("product", ""),
                     "version": svc.get("version", ""),
                     "extrainfo": svc.get("extrainfo", ""),
-                    "cpe": cpe_el.text if cpe_el is not None else "",
+                    "cpe": [el.text for el in svc.findall("cpe") if el.text],
                 }
             )
         return {"services": services}
@@ -122,16 +121,23 @@ class NmapParser:
             return {"os_matches": []}
 
         for match_el in os_el.findall("osmatch"):
-            osclass = match_el.find("osclass")
-            cpe_el = osclass.find("cpe") if osclass is not None else None
+            osclasses = []
+            for osclass in match_el.findall("osclass"):
+                osclasses.append(
+                    {
+                        "type": osclass.get("type", ""),
+                        "vendor": osclass.get("vendor", ""),
+                        "os_family": osclass.get("osfamily", ""),
+                        "os_gen": osclass.get("osgen", ""),
+                        "accuracy": int(osclass.get("accuracy", "0")),
+                        "cpe": [el.text for el in osclass.findall("cpe") if el.text],
+                    }
+                )
             os_matches.append(
                 {
                     "name": match_el.get("name", ""),
                     "accuracy": int(match_el.get("accuracy", "0")),
-                    "vendor": osclass.get("vendor", "") if osclass is not None else "",
-                    "os_family": osclass.get("osfamily", "") if osclass is not None else "",
-                    "os_gen": osclass.get("osgen", "") if osclass is not None else "",
-                    "cpe": cpe_el.text if cpe_el is not None else "",
+                    "osclasses": osclasses,
                 }
             )
         return {"os_matches": os_matches}

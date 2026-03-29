@@ -107,7 +107,7 @@ class TestAgentState:
                     "product": "OpenSSH",
                     "version": "4.7p1",
                     "extrainfo": "Debian 8ubuntu1",
-                    "cpe": "cpe:/a:openbsd:openssh:4.7p1",
+                    "cpe": ["cpe:/a:openbsd:openssh:4.7p1"],
                 },
                 {
                     "port": 80,
@@ -116,7 +116,7 @@ class TestAgentState:
                     "product": "Apache httpd",
                     "version": "2.2.8",
                     "extrainfo": "(Ubuntu) DAV/2",
-                    "cpe": "cpe:/a:apache:http_server:2.2.8",
+                    "cpe": ["cpe:/a:apache:http_server:2.2.8"],
                 },
             ]
         }
@@ -139,10 +139,16 @@ class TestAgentState:
                 {
                     "name": "Linux 2.6.9 - 2.6.33",
                     "accuracy": 95,
-                    "vendor": "Linux",
-                    "os_family": "Linux",
-                    "os_gen": "2.6.X",
-                    "cpe": "cpe:/o:linux:linux_kernel:2.6",
+                    "osclasses": [
+                        {
+                            "type": "general purpose",
+                            "vendor": "Linux",
+                            "os_family": "Linux",
+                            "os_gen": "2.6.X",
+                            "accuracy": 95,
+                            "cpe": ["cpe:/o:linux:linux_kernel:2.6"],
+                        },
+                    ],
                 },
             ]
         }

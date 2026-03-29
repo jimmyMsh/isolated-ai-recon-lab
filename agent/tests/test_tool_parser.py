@@ -92,17 +92,27 @@ class TestParseServiceEnum:
         assert ftp["name"] == "ftp"
         assert ftp["product"] == "vsftpd"
         assert ftp["version"] == "2.3.4"
-        assert ftp["cpe"] == "cpe:/a:vsftpd:vsftpd:2.3.4"
+        assert ftp["cpe"] == ["cpe:/a:vsftpd:vsftpd:2.3.4"]
 
     def test_extrainfo_captured(self):
         result = NmapParser.parse_service_enum(FIXTURES / "service_enum.xml")
         ssh = next(s for s in result["services"] if s["port"] == 22)
         assert ssh["extrainfo"] == "Debian 8ubuntu1"
 
-    def test_missing_cpe_is_empty(self):
+    def test_missing_cpe_is_empty_list(self):
         result = NmapParser.parse_service_enum(FIXTURES / "service_enum.xml")
         smb = next(s for s in result["services"] if s["port"] == 445)
-        assert smb["cpe"] == ""
+        assert smb["cpe"] == []
+
+    def test_cpe_is_list(self):
+        result = NmapParser.parse_service_enum(FIXTURES / "service_enum.xml")
+        ftp = next(s for s in result["services"] if s["port"] == 21)
+        assert ftp["cpe"] == ["cpe:/a:vsftpd:vsftpd:2.3.4"]
+
+    def test_multi_cpe_service(self):
+        result = NmapParser.parse_service_enum(FIXTURES / "service_enum_multi_cpe.xml")
+        ssh = next(s for s in result["services"] if s["port"] == 22)
+        assert ssh["cpe"] == ["cpe:/a:openbsd:openssh:4.7p1", "cpe:/o:linux:linux_kernel"]
 
     def test_empty_xml_returns_empty_services(self):
         result = NmapParser.parse_service_enum(FIXTURES / "empty.xml")
@@ -128,10 +138,36 @@ class TestParseOsFingerprint:
         best = result["os_matches"][0]
         assert best["name"] == "Linux 2.6.9 - 2.6.33"
         assert best["accuracy"] == 95
-        assert best["vendor"] == "Linux"
-        assert best["os_family"] == "Linux"
-        assert best["os_gen"] == "2.6.X"
-        assert best["cpe"] == "cpe:/o:linux:linux_kernel:2.6"
+        assert best["osclasses"][0]["vendor"] == "Linux"
+        assert best["osclasses"][0]["os_family"] == "Linux"
+        assert best["osclasses"][0]["os_gen"] == "2.6.X"
+        assert best["osclasses"][0]["accuracy"] == 95
+        assert best["osclasses"][0]["cpe"] == ["cpe:/o:linux:linux_kernel:2.6"]
+
+    def test_osclasses_is_list(self):
+        result = NmapParser.parse_os_fingerprint(FIXTURES / "os_fingerprint.xml")
+        best = result["os_matches"][0]
+        assert isinstance(best["osclasses"], list)
+        assert len(best["osclasses"]) == 1
+
+    def test_multi_osclass_per_osmatch(self):
+        result = NmapParser.parse_os_fingerprint(FIXTURES / "os_fingerprint_multi_osclass.xml")
+        best = result["os_matches"][0]
+        assert len(best["osclasses"]) == 2
+        assert best["osclasses"][1]["type"] == "WAP"
+
+    def test_osclass_cpe_is_list(self):
+        result = NmapParser.parse_os_fingerprint(FIXTURES / "os_fingerprint_multi_osclass.xml")
+        wap = result["os_matches"][0]["osclasses"][1]
+        assert isinstance(wap["cpe"], list)
+        assert len(wap["cpe"]) == 2
+
+    def test_flat_osclass_fields_removed(self):
+        result = NmapParser.parse_os_fingerprint(FIXTURES / "os_fingerprint.xml")
+        best = result["os_matches"][0]
+        assert "vendor" not in best
+        assert "os_family" not in best
+        assert "os_gen" not in best
 
     def test_empty_xml_returns_empty_matches(self):
         result = NmapParser.parse_os_fingerprint(FIXTURES / "empty.xml")
