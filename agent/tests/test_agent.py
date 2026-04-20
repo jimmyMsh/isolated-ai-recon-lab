@@ -10,9 +10,9 @@ import pytest
 from agent import ReconAgent
 from config import AgentConfig, StageConfig
 from guardrails import Guardrails
-from llm_client import LLMResponse
+from llm_client import LLMError, LLMResponse
 from logger import AgentLogger
-from tool_executor import ExecutionResult
+from tool_executor import CommandBlockedError, ExecutionResult
 
 from .fakes import FakeLLMClient, FakeToolExecutor
 
@@ -604,3 +604,864 @@ class TestZeroHostsDiscovered:
         """Report is generated even when no hosts were discovered."""
         report_path = zero_hosts_run["report_path"]
         assert Path(report_path).exists()
+
+
+# -- Phase 5.3: guardrail retry, fallback, execution failure, skips ------------
+
+TEST_HOST = "192.168.56.101"
+
+
+def _bad_plan_invalid_intensity(host: str = TEST_HOST) -> LLMResponse:
+    """Planning response that fails guardrails on `scan_intensity`."""
+    parsed = {
+        "target": host,
+        "scan_intensity": "invalid",
+        "reasoning": "broken intensity choice",
+    }
+    return LLMResponse(parsed=parsed, raw_content=json.dumps(parsed))
+
+
+def _good_port_scan_plan(host: str = TEST_HOST) -> LLMResponse:
+    parsed = {
+        "target": host,
+        "scan_intensity": "standard",
+        "reasoning": f"Full port scan for {host}.",
+    }
+    return LLMResponse(parsed=parsed, raw_content=json.dumps(parsed))
+
+
+def _generic_interpretation(summary: str = "ok") -> LLMResponse:
+    parsed = {
+        "findings": [],
+        "summary": summary,
+        "recommendations": "Continue pipeline.",
+    }
+    return LLMResponse(parsed=parsed, raw_content=json.dumps(parsed))
+
+
+def _seed_host(agent: ReconAgent, ip: str = TEST_HOST) -> None:
+    """Preseed state with a single discovered host, skipping host_discovery."""
+    agent._state.update_from_discovery([{"ip": ip}])
+
+
+def _seed_ports(agent: ReconAgent, ip: str = TEST_HOST) -> None:
+    """Attach open ports to a seeded host; required for service_enum planning."""
+    agent._state.update_from_port_scan(
+        ip,
+        {
+            "ports": [
+                {"port": 22, "protocol": "tcp", "state": "open"},
+                {"port": 80, "protocol": "tcp", "state": "open"},
+            ]
+        },
+    )
+
+
+def _build_agent(config, llm, tool):
+    logger = AgentLogger(config)
+    agent = ReconAgent(config, llm_client=llm, tool_executor=tool, logger=logger)
+    return agent, logger
+
+
+def _events_for_run(config, trace_id: str) -> list[dict]:
+    return [e for e in _read_log_events(config.log_file) if e.get("trace_id") == trace_id]
+
+
+# -- 5.3a: guardrail retry then success ---------------------------------------
+
+
+@pytest.fixture()
+def guardrail_retry_success_run(config):
+    """One guardrail failure followed by a valid planning response."""
+    llm = FakeLLMClient(
+        [
+            _bad_plan_invalid_intensity(),
+            _good_port_scan_plan(),
+            _generic_interpretation("ports for host"),
+        ]
+    )
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "port_scan.xml", _exec_result_ok(["/usr/bin/nmap", "-sS"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestGuardrailRetryThenSuccess:
+    def test_two_planning_calls_recorded(self, guardrail_retry_success_run):
+        events = guardrail_retry_success_run["events"]
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        assert len(planning) == 2
+        assert [p["stage_attempt"] for p in planning] == [1, 2]
+        assert all(p["parent_span_id"] is None for p in planning)
+
+    def test_retry_prompt_uses_replace_style(self, guardrail_retry_success_run):
+        """On retry the LLM receives system, original user, and a correction user message."""
+        llm = guardrail_retry_success_run["llm"]
+        retry_messages = llm.history[1].messages
+        assert len(retry_messages) == 3
+        assert retry_messages[0]["role"] == "system"
+        assert retry_messages[1]["role"] == "user"
+        assert retry_messages[2]["role"] == "user"
+        assert retry_messages[2]["content"].startswith("Previous attempt rejected:")
+        snippet = retry_messages[2]["content"].removeprefix("Previous attempt rejected: ")
+        assert len(snippet) <= 250
+        # Original user prompt must be preserved verbatim (no failed assistant turn injected)
+        original_messages = llm.history[0].messages
+        assert retry_messages[1]["content"] == original_messages[1]["content"]
+
+    def test_guardrail_violation_parents_to_failed_planning(self, guardrail_retry_success_run):
+        events = guardrail_retry_success_run["events"]
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        violations = [e for e in events if e["event_type"] == "guardrail_violation"]
+        assert len(violations) == 1
+        assert violations[0]["parent_span_id"] == planning[0]["span_id"]
+        assert violations[0]["action_taken"] == "retry_planning"
+        assert violations[0]["rule"] == "invalid_scan_intensity"
+
+    def test_command_exec_sources_from_llm(self, guardrail_retry_success_run):
+        events = guardrail_retry_success_run["events"]
+        cmd_exec = next(e for e in events if e["event_type"] == "command_exec")
+        assert cmd_exec["command_source"] == "llm"
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        assert cmd_exec["parent_span_id"] == planning[1]["span_id"]
+
+    def test_stage_complete_counters(self, guardrail_retry_success_run):
+        events = guardrail_retry_success_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is True
+        assert stage_complete["llm_calls"] == 3
+        assert stage_complete["retries"] == 1
+        assert stage_complete["mitre_technique"] == "T1046"
+
+    def test_state_errors_empty_on_recovered_run(self, guardrail_retry_success_run):
+        assert guardrail_retry_success_run["state"].errors == []
+
+
+# -- 5.3b: retry exhaustion then deterministic fallback -----------------------
+
+
+@pytest.fixture()
+def retry_exhaustion_fallback_run(config):
+    """All three planning attempts fail guardrails; fallback command executes."""
+    llm = FakeLLMClient(
+        [
+            _bad_plan_invalid_intensity(),
+            _bad_plan_invalid_intensity(),
+            _bad_plan_invalid_intensity(),
+            _generic_interpretation("fallback ports"),
+        ]
+    )
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "port_scan.xml", _exec_result_ok(["/usr/bin/nmap", "-sS"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestRetryExhaustionThenFallback:
+    def test_three_planning_attempts_with_incrementing_stage_attempt(
+        self, retry_exhaustion_fallback_run
+    ):
+        events = retry_exhaustion_fallback_run["events"]
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        assert [p["stage_attempt"] for p in planning] == [1, 2, 3]
+        assert all(p["parent_span_id"] is None for p in planning)
+
+    def test_three_guardrail_violations_last_uses_fallback(self, retry_exhaustion_fallback_run):
+        events = retry_exhaustion_fallback_run["events"]
+        violations = [e for e in events if e["event_type"] == "guardrail_violation"]
+        assert len(violations) == 3
+        actions = [v["action_taken"] for v in violations]
+        assert actions == ["retry_planning", "retry_planning", "use_fallback"]
+
+    def test_command_exec_has_fallback_source_and_parents_to_use_fallback(
+        self, retry_exhaustion_fallback_run
+    ):
+        events = retry_exhaustion_fallback_run["events"]
+        cmd_exec = next(e for e in events if e["event_type"] == "command_exec")
+        violations = [e for e in events if e["event_type"] == "guardrail_violation"]
+        use_fallback = next(v for v in violations if v["action_taken"] == "use_fallback")
+        assert cmd_exec["command_source"] == "fallback"
+        assert cmd_exec["parent_span_id"] == use_fallback["span_id"]
+
+    def test_stage_complete_counters_after_fallback(self, retry_exhaustion_fallback_run):
+        events = retry_exhaustion_fallback_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is True
+        # 3 planning + 1 interpretation; fallback itself is deterministic, not an LLM call
+        assert stage_complete["llm_calls"] == 4
+        assert stage_complete["retries"] == 2
+
+    def test_only_one_executor_call_no_internal_retry(self, retry_exhaustion_fallback_run):
+        """The orchestrator wraps a single execute_nmap call; fallback is pre-execute."""
+        assert len(retry_exhaustion_fallback_run["tool"].history) == 1
+
+    def test_state_errors_empty_when_fallback_succeeds(self, retry_exhaustion_fallback_run):
+        """Fallback that executes cleanly is not a skip — no state.errors entry."""
+        assert retry_exhaustion_fallback_run["state"].errors == []
+
+
+# -- 5.3c: service_enum pre-planning deterministic skip -----------------------
+
+
+@pytest.fixture()
+def service_enum_no_ports_run(config):
+    """service_enum for a host with no known open ports — deterministic skip."""
+    llm = FakeLLMClient([])  # no LLM calls expected
+    tool = FakeToolExecutor(results=[], output_dir=Path(config.output_dir))
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "service_enum"
+    agent._run_per_host_stage("service_enum", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestServiceEnumPrePlanningSkip:
+    def test_no_planning_or_command_events(self, service_enum_no_ports_run):
+        events = service_enum_no_ports_run["events"]
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        cmd_exec = [e for e in events if e["event_type"] == "command_exec"]
+        interp = [e for e in events if e["event_type"] == "interpretation_call"]
+        assert planning == []
+        assert cmd_exec == []
+        assert interp == []
+
+    def test_no_llm_or_executor_calls(self, service_enum_no_ports_run):
+        assert len(service_enum_no_ports_run["llm"].history) == 0
+        assert len(service_enum_no_ports_run["tool"].history) == 0
+
+    def test_stage_complete_is_deterministic_skip(self, service_enum_no_ports_run):
+        events = service_enum_no_ports_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is False
+        assert stage_complete["llm_calls"] == 0
+        assert stage_complete["retries"] == 0
+        assert stage_complete["findings_count"] == 0
+        assert stage_complete["skip_category"] == "deterministic_skip"
+        assert stage_complete["reason"] == "no_known_ports"
+        assert stage_complete["host_target"] == TEST_HOST
+        assert stage_complete["mitre_technique"] == "T1046"
+        assert stage_complete["parent_span_id"] is None
+
+    def test_state_errors_records_no_known_ports(self, service_enum_no_ports_run):
+        errors = service_enum_no_ports_run["state"].errors
+        assert len(errors) == 1
+        entry = errors[0]
+        assert entry["stage"] == "service_enum"
+        assert entry["host"] == TEST_HOST
+        assert entry["reason"] == "no_known_ports"
+
+
+# -- 5.3d: service_enum defense-in-depth ValueError backstop ------------------
+
+
+@pytest.fixture()
+def service_enum_defense_in_depth_run(config, monkeypatch):
+    """Pre-planning check passes, but build_fallback raises ValueError after
+    planning exhaustion — post_attempt_skip backstop fires.
+    """
+    llm = FakeLLMClient(
+        [
+            _bad_plan_invalid_intensity(),
+            _bad_plan_invalid_intensity(),
+            _bad_plan_invalid_intensity(),
+        ]
+    )
+    tool = FakeToolExecutor(results=[], output_dir=Path(config.output_dir))
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    _seed_ports(agent)  # pre-planning check passes — ports are known
+
+    def _raise_no_ports(stage, state, target_ip=None):
+        raise ValueError(f"No known open ports for {target_ip} — cannot build {stage} fallback")
+
+    monkeypatch.setattr(agent._command_builder, "build_fallback", _raise_no_ports)
+
+    agent._state.current_stage = "service_enum"
+    agent._run_per_host_stage("service_enum", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestServiceEnumDefenseInDepthSkip:
+    def test_planning_ran_three_times(self, service_enum_defense_in_depth_run):
+        events = service_enum_defense_in_depth_run["events"]
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        assert len(planning) == 3
+
+    def test_no_command_exec_or_interpretation(self, service_enum_defense_in_depth_run):
+        events = service_enum_defense_in_depth_run["events"]
+        cmd_exec = [e for e in events if e["event_type"] == "command_exec"]
+        interp = [e for e in events if e["event_type"] == "interpretation_call"]
+        assert cmd_exec == []
+        assert interp == []
+
+    def test_stage_complete_is_post_attempt_skip(self, service_enum_defense_in_depth_run):
+        events = service_enum_defense_in_depth_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is False
+        assert stage_complete["skip_category"] == "post_attempt_skip"
+        assert stage_complete["reason"] == "no_known_ports"
+        # Planning ran; counters reflect real activity.
+        assert stage_complete["llm_calls"] == 3
+        assert stage_complete["retries"] == 2
+        assert stage_complete["host_target"] == TEST_HOST
+
+    def test_state_errors_records_no_known_ports(self, service_enum_defense_in_depth_run):
+        errors = service_enum_defense_in_depth_run["state"].errors
+        assert len(errors) == 1
+        entry = errors[0]
+        assert entry["stage"] == "service_enum"
+        assert entry["host"] == TEST_HOST
+        assert entry["reason"] == "no_known_ports"
+
+
+# -- 5.3e: LLMError planning recovery -----------------------------------------
+
+
+@pytest.fixture()
+def llm_error_planning_recovery_run(config):
+    """First planning LLM call raises; second succeeds."""
+    llm = FakeLLMClient(
+        [
+            LLMError("connection refused"),
+            _good_port_scan_plan(),
+            _generic_interpretation("ok"),
+        ]
+    )
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "port_scan.xml", _exec_result_ok(["/usr/bin/nmap", "-sS"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestLLMErrorPlanningRecovery:
+    def test_single_planning_call_logged_on_successful_attempt(
+        self, llm_error_planning_recovery_run
+    ):
+        """The failed LLM call did not produce a response to log; only the
+        second (successful) attempt emits a planning_call event.
+        """
+        events = llm_error_planning_recovery_run["events"]
+        planning = [e for e in events if e["event_type"] == "planning_call"]
+        assert len(planning) == 1
+        assert planning[0]["stage_attempt"] == 2
+
+    def test_no_guardrail_violation_emitted_for_llm_error(self, llm_error_planning_recovery_run):
+        events = llm_error_planning_recovery_run["events"]
+        violations = [e for e in events if e["event_type"] == "guardrail_violation"]
+        assert violations == []
+
+    def test_command_exec_source_is_llm_after_recovery(self, llm_error_planning_recovery_run):
+        events = llm_error_planning_recovery_run["events"]
+        cmd_exec = next(e for e in events if e["event_type"] == "command_exec")
+        assert cmd_exec["command_source"] == "llm"
+
+    def test_stage_complete_accounts_for_failed_attempt(self, llm_error_planning_recovery_run):
+        """llm_calls counts the failed planning invocation too (2 planning + 1 interp)."""
+        events = llm_error_planning_recovery_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is True
+        assert stage_complete["llm_calls"] == 3
+        assert stage_complete["retries"] == 1
+
+
+# -- 5.3f: execution failure skips interpretation -----------------------------
+
+
+def _exec_result_timeout() -> ExecutionResult:
+    return ExecutionResult(
+        command=["/usr/bin/nmap", "-sS", TEST_HOST],
+        return_code=-1,
+        stdout="",
+        stderr="",
+        xml_output_path=None,
+        duration_seconds=120.0,
+        timed_out=True,
+    )
+
+
+@pytest.fixture()
+def execution_failure_run(config):
+    """Planning succeeds; executor reports timeout. Interpretation must not run."""
+    llm = FakeLLMClient([_good_port_scan_plan()])
+    tool = FakeToolExecutor(results=[_exec_result_timeout()], output_dir=Path(config.output_dir))
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestExecutionFailureSkipsInterpretation:
+    def test_planning_and_command_exec_run(self, execution_failure_run):
+        events = execution_failure_run["events"]
+        assert [e for e in events if e["event_type"] == "planning_call"]
+        assert [e for e in events if e["event_type"] == "command_exec"]
+
+    def test_state_update_and_interpretation_skipped(self, execution_failure_run):
+        events = execution_failure_run["events"]
+        assert [e for e in events if e["event_type"] == "state_update"] == []
+        assert [e for e in events if e["event_type"] == "interpretation_call"] == []
+
+    def test_error_event_records_nmap_timeout(self, execution_failure_run):
+        events = execution_failure_run["events"]
+        errors = [e for e in events if e["event_type"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["error_type"] == "nmap_timeout"
+        assert errors[0]["recoverable"] is False
+
+    def test_state_errors_records_execution_failed(self, execution_failure_run):
+        errors = execution_failure_run["state"].errors
+        assert len(errors) == 1
+        entry = errors[0]
+        assert entry["stage"] == "port_scan"
+        assert entry["host"] == TEST_HOST
+        assert entry["reason"] == "execution_failed"
+
+    def test_stage_complete_is_post_attempt_skip(self, execution_failure_run):
+        events = execution_failure_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is False
+        assert stage_complete["skip_category"] == "post_attempt_skip"
+        assert stage_complete["reason"] == "execution_failed"
+        # Interpretation never ran; llm_calls counts only the planning invocation.
+        assert stage_complete["llm_calls"] == 1
+        assert stage_complete["retries"] == 0
+
+    def test_only_one_llm_call(self, execution_failure_run):
+        """Interpretation must not consume an LLM response when execution fails."""
+        assert len(execution_failure_run["llm"].history) == 1
+
+
+# -- 5.3g: os_fingerprint without known ports ---------------------------------
+
+
+def _good_os_fingerprint_plan(host: str = TEST_HOST) -> LLMResponse:
+    parsed = {
+        "target": host,
+        "scan_intensity": "standard",
+        "reasoning": f"OS fingerprint for {host}.",
+    }
+    return LLMResponse(parsed=parsed, raw_content=json.dumps(parsed))
+
+
+@pytest.fixture()
+def os_fingerprint_no_ports_run(config):
+    """os_fingerprint runs normally even when the host has no known ports."""
+    llm = FakeLLMClient(
+        [
+            _good_os_fingerprint_plan(),
+            _generic_interpretation("os guess"),
+        ]
+    )
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "os_fingerprint.xml", _exec_result_ok(["/usr/bin/nmap", "-O"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "os_fingerprint"
+    agent._run_per_host_stage("os_fingerprint", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestOsFingerprintWithoutKnownPorts:
+    def test_full_pipeline_events_emitted(self, os_fingerprint_no_ports_run):
+        events = os_fingerprint_no_ports_run["events"]
+        types = [e["event_type"] for e in events]
+        assert types == [
+            "planning_call",
+            "command_exec",
+            "state_update",
+            "interpretation_call",
+            "stage_complete",
+        ]
+
+    def test_stage_complete_success(self, os_fingerprint_no_ports_run):
+        events = os_fingerprint_no_ports_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is True
+        assert stage_complete["llm_calls"] == 2
+        assert stage_complete["retries"] == 0
+        assert stage_complete["mitre_technique"] == "T1082"
+
+    def test_state_errors_empty(self, os_fingerprint_no_ports_run):
+        assert os_fingerprint_no_ports_run["state"].errors == []
+
+
+# -- 5.3h: multi-host fallback scoping ----------------------------------------
+
+FIRST_HOST = "192.168.56.1"
+SECOND_HOST = "192.168.56.101"
+
+
+@pytest.fixture()
+def multi_host_fallback_run(config):
+    """Two hosts in state; planning for the second host exhausts.
+
+    The deterministic fallback must scope to SECOND_HOST even though it is
+    not the first in sorted order. If the orchestrator passed the default
+    (first-discovered) target to build_fallback, the executed command would
+    target FIRST_HOST and this test would fail.
+    """
+    llm = FakeLLMClient(
+        [
+            _bad_plan_invalid_intensity(SECOND_HOST),
+            _bad_plan_invalid_intensity(SECOND_HOST),
+            _bad_plan_invalid_intensity(SECOND_HOST),
+            _generic_interpretation("fallback ok"),
+        ]
+    )
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "port_scan.xml", _exec_result_ok(["/usr/bin/nmap", "-sS"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    agent._state.update_from_discovery([{"ip": FIRST_HOST}, {"ip": SECOND_HOST}])
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", SECOND_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestMultiHostFallbackScoping:
+    def test_fallback_command_targets_current_host_not_first_discovered(
+        self, multi_host_fallback_run
+    ):
+        """build_fallback must be called with target_ip=SECOND_HOST."""
+        tool = multi_host_fallback_run["tool"]
+        assert len(tool.history) == 1
+        call = tool.history[0]
+        assert SECOND_HOST in call.args, (
+            f"Fallback command missing current host {SECOND_HOST}: {call.args}"
+        )
+        assert FIRST_HOST not in call.args, (
+            f"Fallback leaked to first-discovered host {FIRST_HOST}: {call.args}"
+        )
+
+    def test_fallback_output_filename_scoped_to_current_host(self, multi_host_fallback_run):
+        """The xml output filename encodes the scanned target."""
+        tool = multi_host_fallback_run["tool"]
+        filename = tool.history[0].output_filename
+        assert SECOND_HOST in filename
+        assert f"{FIRST_HOST}_" not in filename
+
+    def test_command_exec_marks_fallback_provenance(self, multi_host_fallback_run):
+        events = multi_host_fallback_run["events"]
+        cmd_exec = next(e for e in events if e["event_type"] == "command_exec")
+        assert cmd_exec["command_source"] == "fallback"
+        assert cmd_exec["host_target"] == SECOND_HOST
+
+    def test_state_update_scoped_to_current_host(self, multi_host_fallback_run):
+        """Fallback-driven state update writes ports for the current host only."""
+        state = multi_host_fallback_run["state"]
+        assert state.discovered_hosts[SECOND_HOST].open_ports
+        # The other host must not have inherited ports from this fallback run.
+        assert state.discovered_hosts[FIRST_HOST].open_ports == []
+
+
+# -- 5.3i: LLMError exhaustion then deterministic fallback --------------------
+
+
+@pytest.fixture()
+def llm_error_exhaustion_fallback_run(config):
+    """All three planning attempts raise LLMError; fallback runs."""
+    llm = FakeLLMClient(
+        [
+            LLMError("connection refused"),
+            LLMError("connection refused"),
+            LLMError("connection refused"),
+            _generic_interpretation("recovered via fallback"),
+        ]
+    )
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "port_scan.xml", _exec_result_ok(["/usr/bin/nmap", "-sS"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestLLMErrorExhaustionFallback:
+    def test_no_planning_call_events_logged(self, llm_error_exhaustion_fallback_run):
+        """LLMError means there is no response to record; nothing is logged."""
+        events = llm_error_exhaustion_fallback_run["events"]
+        assert [e for e in events if e["event_type"] == "planning_call"] == []
+
+    def test_no_guardrail_violation_events(self, llm_error_exhaustion_fallback_run):
+        events = llm_error_exhaustion_fallback_run["events"]
+        assert [e for e in events if e["event_type"] == "guardrail_violation"] == []
+
+    def test_command_exec_is_fallback_with_no_parent(self, llm_error_exhaustion_fallback_run):
+        """No planning or violation event exists to parent command_exec under."""
+        events = llm_error_exhaustion_fallback_run["events"]
+        cmd_exec = next(e for e in events if e["event_type"] == "command_exec")
+        assert cmd_exec["command_source"] == "fallback"
+        assert cmd_exec["parent_span_id"] is None
+
+    def test_full_pipeline_completes_and_counters_are_correct(
+        self, llm_error_exhaustion_fallback_run
+    ):
+        """All three failed attempts count toward llm_calls; one interp call."""
+        events = llm_error_exhaustion_fallback_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is True
+        assert stage_complete["llm_calls"] == 4
+        assert stage_complete["retries"] == 2
+
+    def test_state_errors_empty_when_fallback_succeeds(self, llm_error_exhaustion_fallback_run):
+        assert llm_error_exhaustion_fallback_run["state"].errors == []
+
+    def test_four_llm_calls_in_history(self, llm_error_exhaustion_fallback_run):
+        """Three failed planning calls + one interpretation."""
+        assert len(llm_error_exhaustion_fallback_run["llm"].history) == 4
+
+
+# -- 5.3j: CommandBlockedError execution-failure branch -----------------------
+
+
+@pytest.fixture()
+def command_blocked_run(config):
+    """Planning validates, but the executor rejects the final command."""
+    llm = FakeLLMClient([_good_port_scan_plan()])
+    blocked = CommandBlockedError(
+        "target_outside_subnet",
+        "Target 10.0.0.1 is outside allowed subnet",
+        ["/usr/bin/nmap", "10.0.0.1"],
+    )
+    tool = FakeToolExecutor(results=[blocked], output_dir=Path(config.output_dir))
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestCommandBlockedExecutionFailure:
+    def test_no_command_exec_event_logged(self, command_blocked_run):
+        """The command never ran, so no command_exec event is emitted."""
+        events = command_blocked_run["events"]
+        assert [e for e in events if e["event_type"] == "command_exec"] == []
+
+    def test_error_event_records_command_blocked(self, command_blocked_run):
+        events = command_blocked_run["events"]
+        errors = [e for e in events if e["event_type"] == "error"]
+        assert len(errors) == 1
+        err = errors[0]
+        assert err["error_type"] == "command_blocked"
+        assert err["rule"] == "target_outside_subnet"
+        assert err["recoverable"] is False
+
+    def test_interpretation_skipped(self, command_blocked_run):
+        events = command_blocked_run["events"]
+        assert [e for e in events if e["event_type"] == "interpretation_call"] == []
+        assert [e for e in events if e["event_type"] == "state_update"] == []
+
+    def test_stage_complete_is_post_attempt_skip(self, command_blocked_run):
+        events = command_blocked_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is False
+        assert stage_complete["skip_category"] == "post_attempt_skip"
+        assert stage_complete["reason"] == "execution_failed"
+        assert stage_complete["llm_calls"] == 1
+        assert stage_complete["retries"] == 0
+
+    def test_state_errors_records_execution_failed(self, command_blocked_run):
+        errors = command_blocked_run["state"].errors
+        assert len(errors) == 1
+        entry = errors[0]
+        assert entry["stage"] == "port_scan"
+        assert entry["host"] == TEST_HOST
+        assert entry["reason"] == "execution_failed"
+        assert "command_blocked" in (entry["detail"] or "")
+
+
+# -- 5.3k: nmap_nonzero_exit execution-failure branch -------------------------
+
+
+def _exec_result_nonzero_exit() -> ExecutionResult:
+    return ExecutionResult(
+        command=["/usr/bin/nmap", "-sS", TEST_HOST],
+        return_code=2,
+        stdout="",
+        stderr="failed to resolve target",
+        xml_output_path=None,
+        duration_seconds=0.4,
+        timed_out=False,
+    )
+
+
+@pytest.fixture()
+def nonzero_exit_run(config):
+    llm = FakeLLMClient([_good_port_scan_plan()])
+    tool = FakeToolExecutor(
+        results=[_exec_result_nonzero_exit()], output_dir=Path(config.output_dir)
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestNmapNonzeroExit:
+    def test_command_exec_logged_with_nonzero_return_code(self, nonzero_exit_run):
+        events = nonzero_exit_run["events"]
+        cmd_exec = next(e for e in events if e["event_type"] == "command_exec")
+        assert cmd_exec["return_code"] == 2
+
+    def test_error_event_records_nmap_nonzero_exit(self, nonzero_exit_run):
+        events = nonzero_exit_run["events"]
+        errors = [e for e in events if e["event_type"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["error_type"] == "nmap_nonzero_exit"
+        assert errors[0]["recoverable"] is False
+
+    def test_interpretation_skipped(self, nonzero_exit_run):
+        events = nonzero_exit_run["events"]
+        assert [e for e in events if e["event_type"] == "interpretation_call"] == []
+        assert [e for e in events if e["event_type"] == "state_update"] == []
+
+    def test_stage_complete_is_post_attempt_skip(self, nonzero_exit_run):
+        events = nonzero_exit_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is False
+        assert stage_complete["skip_category"] == "post_attempt_skip"
+        assert stage_complete["reason"] == "execution_failed"
+
+    def test_state_errors_records_execution_failed(self, nonzero_exit_run):
+        errors = nonzero_exit_run["state"].errors
+        assert len(errors) == 1
+        assert errors[0]["reason"] == "execution_failed"
+        assert errors[0]["detail"] == "nmap_nonzero_exit"
+
+
+# -- 5.3l: permission_error execution-failure branch --------------------------
+
+
+def _exec_result_permission_error() -> ExecutionResult:
+    return ExecutionResult(
+        command=["/usr/bin/nmap", "-sS", TEST_HOST],
+        return_code=1,
+        stdout="",
+        stderr="You requested a scan type which requires root privileges.",
+        xml_output_path=None,
+        duration_seconds=0.1,
+        timed_out=False,
+    )
+
+
+@pytest.fixture()
+def permission_error_run(config):
+    llm = FakeLLMClient([_good_port_scan_plan()])
+    tool = FakeToolExecutor(
+        results=[_exec_result_permission_error()], output_dir=Path(config.output_dir)
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    _seed_host(agent)
+    agent._state.current_stage = "port_scan"
+    agent._run_per_host_stage("port_scan", TEST_HOST)
+    logger.close()
+
+    events = _events_for_run(config, trace_id)
+    return {"agent": agent, "llm": llm, "tool": tool, "events": events, "state": agent._state}
+
+
+class TestPermissionErrorExecutionFailure:
+    def test_error_event_records_permission_error(self, permission_error_run):
+        events = permission_error_run["events"]
+        errors = [e for e in events if e["event_type"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["error_type"] == "permission_error"
+
+    def test_interpretation_skipped(self, permission_error_run):
+        events = permission_error_run["events"]
+        assert [e for e in events if e["event_type"] == "interpretation_call"] == []
+        assert [e for e in events if e["event_type"] == "state_update"] == []
+
+    def test_stage_complete_is_post_attempt_skip(self, permission_error_run):
+        events = permission_error_run["events"]
+        stage_complete = next(e for e in events if e["event_type"] == "stage_complete")
+        assert stage_complete["success"] is False
+        assert stage_complete["skip_category"] == "post_attempt_skip"
+        assert stage_complete["reason"] == "execution_failed"
+        assert stage_complete["llm_calls"] == 1
+
+    def test_state_errors_records_execution_failed(self, permission_error_run):
+        errors = permission_error_run["state"].errors
+        assert len(errors) == 1
+        assert errors[0]["reason"] == "execution_failed"
+        assert errors[0]["detail"] == "permission_error"
