@@ -152,7 +152,7 @@ class ReportGenerator:
         if error_count == 0:
             sentence2 = "All pipeline stages completed successfully."
         else:
-            sentence2 = f"Pipeline completed with {error_count} stage failure(s)."
+            sentence2 = f"Pipeline completed with {error_count} failure/skip event(s)."
 
         return f"## Executive Summary\n\n{sentence1} {sentence2}\n"
 

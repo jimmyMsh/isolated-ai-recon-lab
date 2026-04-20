@@ -462,6 +462,29 @@ class TestExecutiveSummary:
     def test_contains_subnet(self):
         assert "192.168.56.0/24" in self.report
 
+    def test_error_count_uses_failure_skip_wording(self, config):
+        """Shared Semantic #2: state.errors records failure/skip events, not literal
+        stage failures. Executive summary wording must match.
+        """
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.errors.append(
+            {
+                "stage": "service_enum",
+                "host": "192.168.56.101",
+                "reason": "no_known_ports",
+                "detail": None,
+            }
+        )
+        _write_synthetic_log(config.log_file, TRACE_ID)
+        gen = ReportGenerator(config)
+        path = gen.generate(state, config.log_file, trace_id=TRACE_ID)
+        report = Path(path).read_text()
+        assert "Pipeline completed with 1 failure/skip event(s)." in report
+        assert "stage failure" not in report.lower()
+
 
 # ---------------------------------------------------------------------------
 # TestScopeSection

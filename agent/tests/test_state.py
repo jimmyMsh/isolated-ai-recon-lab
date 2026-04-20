@@ -299,3 +299,184 @@ class TestAgentState:
         # Should not raise — creates the host entry
         state.update_from_port_scan("192.168.56.101", parsed)
         assert "192.168.56.101" in state.discovered_hosts
+
+
+class TestUpdateDeltaReturns:
+    """Shared Semantic #6 / File-Change Inventory: update_from_* methods return
+    sparse delta dicts recording only what changed for this call.
+    """
+
+    def test_update_from_discovery_returns_hosts_added(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        parsed = [
+            {"ip": "192.168.56.101", "mac": None, "hostname": None},
+            {"ip": "192.168.56.1", "mac": None, "hostname": None},
+        ]
+        delta = state.update_from_discovery(parsed)
+        assert delta == {"hosts_added": ["192.168.56.101", "192.168.56.1"]}
+
+    def test_update_from_discovery_attacker_excluded_from_delta(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        parsed = [
+            {"ip": "192.168.56.10", "mac": None, "hostname": None},
+            {"ip": "192.168.56.101", "mac": None, "hostname": None},
+        ]
+        delta = state.update_from_discovery(parsed)
+        assert delta == {"hosts_added": ["192.168.56.101"]}
+
+    def test_update_from_discovery_only_new_hosts(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        parsed = [
+            {"ip": "192.168.56.101", "mac": None, "hostname": None},
+            {"ip": "192.168.56.102", "mac": None, "hostname": None},
+        ]
+        delta = state.update_from_discovery(parsed)
+        assert delta == {"hosts_added": ["192.168.56.102"]}
+
+    def test_update_from_port_scan_returns_ports_added(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        parsed = {
+            "ports": [
+                {"port": 22, "protocol": "tcp", "state": "open"},
+                {"port": 80, "protocol": "tcp", "state": "open"},
+            ]
+        }
+        delta = state.update_from_port_scan("192.168.56.101", parsed)
+        assert delta == {"ports_added": {"192.168.56.101": [22, 80]}}
+
+    def test_update_from_port_scan_empty_is_empty_delta(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        delta = state.update_from_port_scan("192.168.56.101", {"ports": []})
+        assert delta == {}
+
+    def test_update_from_service_enum_returns_services_added(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        svc = {
+            "port": 22,
+            "protocol": "tcp",
+            "name": "ssh",
+            "product": "OpenSSH",
+            "version": "4.7p1",
+            "extrainfo": "",
+            "cpe": ["cpe:/a:openbsd:openssh:4.7p1"],
+        }
+        delta = state.update_from_service_enum("192.168.56.101", {"services": [svc]})
+        assert delta == {"services_added": {"192.168.56.101": [svc]}}
+
+    def test_update_from_service_enum_empty_is_empty_delta(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        delta = state.update_from_service_enum("192.168.56.101", {"services": []})
+        assert delta == {}
+
+    def test_update_from_os_fingerprint_returns_os_matches_added(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        match = {"name": "Linux 2.6.9 - 2.6.33", "accuracy": 95, "osclasses": []}
+        delta = state.update_from_os_fingerprint("192.168.56.101", {"os_matches": [match]})
+        assert delta == {"os_matches_added": {"192.168.56.101": [match]}}
+
+    def test_update_from_os_fingerprint_empty_is_empty_delta(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.discovered_hosts["192.168.56.101"] = HostState(ip="192.168.56.101")
+        delta = state.update_from_os_fingerprint("192.168.56.101", {"os_matches": []})
+        assert delta == {}
+
+
+class TestToLogSnapshot:
+    """File-Change Inventory: to_log_snapshot() — full, canonical shape including errors."""
+
+    def test_empty_state_snapshot(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        snap = state.to_log_snapshot()
+        assert snap == {
+            "target_subnet": "192.168.56.0/24",
+            "attacker_ip": "192.168.56.10",
+            "current_stage": "",
+            "current_target": None,
+            "stages_completed": [],
+            "errors": [],
+            "discovered_hosts": {},
+        }
+
+    def test_snapshot_serializes_host_fields(self):
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        host = HostState(
+            ip="192.168.56.101",
+            mac="52:54:00:DA:01:01",
+            hostname="metasploitable.localdomain",
+        )
+        host.open_ports = [{"port": 22, "protocol": "tcp", "state": "open"}]
+        host.services = [{"port": 22, "name": "ssh"}]
+        host.os_matches = [{"name": "Linux", "accuracy": 95}]
+        state.discovered_hosts["192.168.56.101"] = host
+
+        snap = state.to_log_snapshot()
+        assert snap["discovered_hosts"]["192.168.56.101"] == {
+            "mac": "52:54:00:DA:01:01",
+            "hostname": "metasploitable.localdomain",
+            "open_ports": [{"port": 22, "protocol": "tcp", "state": "open"}],
+            "services": [{"port": 22, "name": "ssh"}],
+            "os_matches": [{"name": "Linux", "accuracy": 95}],
+        }
+
+    def test_snapshot_includes_errors(self):
+        """Unlike to_prompt_context(), the log snapshot must include errors."""
+        state = AgentState(
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+        )
+        state.errors.append(
+            {
+                "stage": "port_scan",
+                "host": "192.168.56.101",
+                "reason": "execution_failed",
+                "detail": "timeout",
+            }
+        )
+        snap = state.to_log_snapshot()
+        assert snap["errors"] == [
+            {
+                "stage": "port_scan",
+                "host": "192.168.56.101",
+                "reason": "execution_failed",
+                "detail": "timeout",
+            }
+        ]
