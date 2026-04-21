@@ -7,12 +7,15 @@ import time
 from pathlib import Path
 
 from config import StageConfig
+from llm_client import LLMError
 from prompt_templates import INTERPRETATION_SCHEMA, build_interpretation_prompt
 from report_generator import ReportGenerator
 from tool_executor import CommandBlockedError, ExecutionResult
 
 from .outcomes import HostStageOutcome, _host_kwargs
 from .planning import _PlanResult
+
+_MAX_INTERPRETATION_ATTEMPTS = 2
 
 _PERMISSION_STDERR_MARKERS = (
     "requires root privileges",
@@ -192,11 +195,11 @@ class _RuntimeMixin:
         parent_span: str | None,
         stage_start: float,
     ) -> None:
-        """Emit a post-attempt skip: planning or execution was attempted but
-        the unit ended without a successful state update.
+        """Emit a post-attempt skip after a host-stage unit has started but
+        cannot continue normally.
 
-        Counters reflect the actual planning (and interpretation, if any)
-        invocations that took place. One entry is added to ``state.errors``.
+        Counters reflect the actual planning and interpretation invocations
+        that took place. One entry is added to ``state.errors``.
         """
         self._state.errors.append(
             {"stage": stage, "host": host, "reason": reason, "detail": detail}
@@ -256,7 +259,16 @@ class _RuntimeMixin:
         target_info: str | None,
         parent_span: str,
         outcome: HostStageOutcome,
-    ) -> str:
+    ) -> str | None:
+        """Call the interpretation LLM with a single transport-level retry.
+
+        Returns the ``interpretation_call`` span_id on success, or ``None``
+        if both attempts raised ``LLMError``. In the failure case an
+        ``error`` event is logged with ``error_type="llm_interpretation_failed"``;
+        the caller still emits ``stage_complete(success=true)`` because the
+        recon goal (state updated from XML) was met, and ``state.errors`` is
+        NOT appended.
+        """
         interp_messages = build_interpretation_prompt(
             stage,
             prompt_context,
@@ -264,23 +276,45 @@ class _RuntimeMixin:
             self._config,
             current_target_info=target_info,
         )
-        interp = self._llm.call(interp_messages, INTERPRETATION_SCHEMA)
-        outcome.interpretation_attempts = 1
-        interp_span = self._logger.log_event(
-            "interpretation_call",
+        host_kwargs = _host_kwargs(host)
+        last_error: LLMError | None = None
+        for attempt in range(1, _MAX_INTERPRETATION_ATTEMPTS + 1):
+            try:
+                interp = self._llm.call(interp_messages, INTERPRETATION_SCHEMA)
+            except LLMError as exc:
+                outcome.interpretation_attempts = attempt
+                last_error = exc
+                continue
+            outcome.interpretation_attempts = attempt
+            interp_span = self._logger.log_event(
+                "interpretation_call",
+                stage,
+                {
+                    "llm_input": {"messages": interp_messages},
+                    "llm_output": {
+                        "parsed": interp.parsed,
+                        "raw_content": interp.raw_content,
+                    },
+                },
+                parent_span_id=parent_span,
+                **host_kwargs,
+            )
+            outcome.interpretation_succeeded = True
+            return interp_span
+
+        self._logger.log_event(
+            "error",
             stage,
             {
-                "llm_input": {"messages": interp_messages},
-                "llm_output": {
-                    "parsed": interp.parsed,
-                    "raw_content": interp.raw_content,
-                },
+                "error_type": "llm_interpretation_failed",
+                "error_message": str(last_error) if last_error else "",
+                "recoverable": False,
+                "action_taken": "skip_interpretation",
             },
             parent_span_id=parent_span,
-            **_host_kwargs(host),
+            **host_kwargs,
         )
-        outcome.interpretation_succeeded = True
-        return interp_span
+        return None
 
     def _emit_stage_success(
         self,
