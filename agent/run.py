@@ -5,6 +5,8 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
