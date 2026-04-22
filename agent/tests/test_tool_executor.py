@@ -348,6 +348,78 @@ class TestExecuteNmapTimeout:
         assert result.xml_output_path is not None
         assert result.xml_output_path == str(xml_path)
 
+    def test_bytes_stdout_stderr_are_decoded(self, executor, config, monkeypatch):
+        out_xml = str(Path(config.output_dir).resolve() / "out.xml")
+        args = ["-sS", VALID_TARGET, "-oX", out_xml]
+
+        def fake_run(*a, **kw):
+            raise subprocess.TimeoutExpired(
+                cmd=a[0],
+                timeout=kw.get("timeout", 1),
+                output=b"partial stdout\n",
+                stderr=b"partial stderr\n",
+            )
+
+        monkeypatch.setattr("tool_executor.subprocess.run", fake_run)
+        result = executor.execute_nmap(args, output_filename="out.xml", timeout=1)
+        assert result.timed_out is True
+        assert result.return_code == -1
+        assert isinstance(result.stdout, str)
+        assert isinstance(result.stderr, str)
+        assert result.stdout == "partial stdout\n"
+        assert result.stderr == "partial stderr\n"
+
+    def test_logger_serializes_timeout_result(self, tmp_path, monkeypatch):
+        import json
+
+        from logger import AgentLogger
+
+        cfg = AgentConfig(
+            ollama_url="http://localhost:11434",
+            model="qwen3:8b",
+            target_subnet="192.168.56.0/24",
+            attacker_ip="192.168.56.10",
+            nmap_path="/usr/bin/nmap",
+            output_dir=str(tmp_path),
+            log_file=str(tmp_path / "agent.log.jsonl"),
+        )
+        ex = ToolExecutor(cfg, Guardrails(cfg))
+        lg = AgentLogger(cfg)
+
+        out_xml = str(Path(cfg.output_dir).resolve() / "out.xml")
+        args = ["-sS", VALID_TARGET, "-oX", out_xml]
+
+        def fake_run(*a, **kw):
+            raise subprocess.TimeoutExpired(
+                cmd=a[0],
+                timeout=kw.get("timeout", 1),
+                output=b"partial stdout\n",
+                stderr=b"partial stderr\n",
+            )
+
+        monkeypatch.setattr("tool_executor.subprocess.run", fake_run)
+        result = ex.execute_nmap(args, output_filename="out.xml", timeout=1)
+
+        lg.log_event(
+            "command_exec",
+            "service_enum",
+            {
+                "command": result.command,
+                "return_code": result.return_code,
+                "stdout_preview": result.stdout[:500],
+                "xml_output_path": result.xml_output_path,
+                "duration_seconds": result.duration_seconds,
+                "command_source": "llm",
+            },
+        )
+        lg.close()
+
+        lines = Path(cfg.log_file).read_text().splitlines()
+        assert len(lines) == 1
+        parsed = json.loads(lines[0])
+        assert isinstance(parsed["stdout_preview"], str)
+        assert parsed["stdout_preview"] == "partial stdout\n"
+
 
 # ---------------------------------------------------------------------------
 # TestExecuteNmapRetry

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sV -p 22,80,443,5000,8080 127.0.0.1" start="1710000000">
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="127.0.0.1" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="10.2" extrainfo="protocol 2.0" method="probed" conf="10">
+          <cpe>cpe:/a:openbsd:openssh:10.2</cpe>
+        </service>
+      </port>
+      <port protocol="tcp" portid="80">
+        <state state="closed" reason="conn-refused"/>
+        <service name="http" method="table" conf="3"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="closed" reason="conn-refused"/>
+        <service name="https" method="table" conf="3"/>
+      </port>
+      <port protocol="tcp" portid="5000">
+        <state state="filtered" reason="no-response"/>
+        <service name="upnp" method="table" conf="3"/>
+      </port>
+      <port protocol="tcp" portid="8080">
+        <state state="closed" reason="conn-refused"/>
+        <service name="http-proxy" method="table" conf="3"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>

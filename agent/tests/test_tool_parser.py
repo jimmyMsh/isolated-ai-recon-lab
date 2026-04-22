@@ -126,6 +126,51 @@ class TestParseServiceEnum:
         result = NmapParser.parse_service_enum(FIXTURES / "malformed.xml")
         assert result["services"] == []
 
+    def test_skips_closed_port_service_entries(self, tmp_path):
+        xml = """<?xml version="1.0"?>
+<nmaprun><host>
+  <ports>
+    <port protocol="tcp" portid="22">
+      <state state="open"/>
+      <service name="ssh" product="OpenSSH" version="10.2"/>
+    </port>
+    <port protocol="tcp" portid="80">
+      <state state="closed"/>
+      <service name="http" method="table" conf="3"/>
+    </port>
+    <port protocol="tcp" portid="443">
+      <state state="filtered"/>
+      <service name="https" method="table" conf="3"/>
+    </port>
+  </ports>
+</host></nmaprun>"""
+        path = tmp_path / "se.xml"
+        path.write_text(xml)
+        result = NmapParser.parse_service_enum(path)
+        assert len(result["services"]) == 1
+        assert result["services"][0]["port"] == 22
+        assert result["services"][0]["name"] == "ssh"
+
+    def test_skips_port_with_no_state_element(self, tmp_path):
+        xml = """<?xml version="1.0"?>
+<nmaprun><host><ports>
+  <port protocol="tcp" portid="22">
+    <service name="ssh"/>
+  </port>
+</ports></host></nmaprun>"""
+        path = tmp_path / "se.xml"
+        path.write_text(xml)
+        result = NmapParser.parse_service_enum(path)
+        assert result["services"] == []
+
+    def test_closed_port_fixture_returns_only_open_services(self):
+        fixture = Path(__file__).parent / "fixtures" / "service_enum_closed_table.xml"
+        result = NmapParser.parse_service_enum(fixture)
+        assert len(result["services"]) == 1
+        assert result["services"][0]["port"] == 22
+        assert result["services"][0]["product"] == "OpenSSH"
+        assert result["services"][0]["version"] == "10.2"
+
 
 class TestParseOsFingerprint:
     def test_extracts_os_matches(self):
