@@ -87,6 +87,9 @@ class NmapParser:
             return {"services": []}
 
         for port_el in ports_el.findall("port"):
+            state_el = port_el.find("state")
+            if state_el is None or state_el.get("state") != "open":
+                continue
             svc = port_el.find("service")
             if svc is None:
                 continue
