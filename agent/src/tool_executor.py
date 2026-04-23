@@ -26,6 +26,14 @@ def _extract_oxml_path(args: list[str]) -> str | None:
     return None
 
 
+def _coerce_str(x: str | bytes | None) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="replace")
+    return x
+
+
 class CommandBlockedError(Exception):
     def __init__(self, rule: str, detail: str, blocked_args: list[str]) -> None:
         self.rule = rule
@@ -87,8 +95,8 @@ class ToolExecutor:
                 return ExecutionResult(
                     command=full_command,
                     return_code=-1,
-                    stdout=exc.stdout or "",
-                    stderr=exc.stderr or "",
+                    stdout=_coerce_str(exc.stdout),
+                    stderr=_coerce_str(exc.stderr),
                     xml_output_path=str(xml_path) if xml_path.exists() else None,
                     duration_seconds=duration,
                     timed_out=True,
