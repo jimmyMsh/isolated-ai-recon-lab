@@ -1,6 +1,10 @@
 # Dark Agents — Lab Setup
 
-Creates an isolated KVM lab for AI-driven recon research: an attacker VM that can only reach a local LLM inference server, and an intentionally-vulnerable target with no external access.
+Creates a KVM/libvirt lab for AI-driven recon research: an attacker VM that can only reach a local LLM inference server over its NAT interface, and an intentionally-vulnerable target with no routed LAN or internet access.
+
+The lab uses two layers of separation:
+1. A libvirt NAT network for controlled attacker → inference-server access.
+2. A separate libvirt isolated network for attacker → target recon traffic.
 
 ## Architecture
 
@@ -18,6 +22,8 @@ The attacker VM has two NICs: one NAT (for inference server access only, locked 
 
 ## IP and MAC Reference
 
+> **Setup-specific values:** Everything *inside* the libvirt boundary (MACs, the two libvirt subnets, attacker/target IPs) is hard-coded by `infra/01–04` and you should not change it unless you also edit those scripts. The **inference server IP is the only value you must set yourself** — it's whatever IP your Mac (or other inference host) currently has on your home LAN. Wherever this guide writes a concrete inference IP, treat it as illustrative; substitute your own.
+
 | Component | MAC | IP | Network |
 |---|---|---|---|
 | Attacker (NAT NIC) | `52:54:00:DA:00:11` | `192.168.122.10` | default NAT |
@@ -25,7 +31,7 @@ The attacker VM has two NICs: one NAT (for inference server access only, locked 
 | Target | `52:54:00:DA:01:01` | `192.168.56.101` | darkagents-isolated |
 | Libvirt gateway (NAT) | — | `192.168.122.1` | default NAT |
 | Libvirt gateway (Isolated) | — | `192.168.56.1` | darkagents-isolated |
-| Inference server | — | *Your Mac's LAN IP* | Home LAN |
+| Inference server | — | *Your Mac's LAN IP — DHCP, will vary* | Home LAN |
 
 ---
 
@@ -42,8 +48,8 @@ Download the **Ubuntu 24.04 LTS Desktop** ISO from [ubuntu.com](https://ubuntu.c
 ### 1.2 BIOS Setup
 
 Before booting from USB, enter BIOS (typically F2, F12, or Del at boot) and confirm:
-- **Intel VT-x** (Intel Virtualization Technology) — **must be enabled**
-- **VT-d** — enable if available (IOMMU; required for device passthrough)
+- **Intel VT-x / AMD-V** — **must be enabled**
+- **VT-d / AMD-Vi / IOMMU** — enable if available (required for device passthrough; useful to have on even if this lab does not use passthrough)
 - Boot order: USB first
 
 ### 1.3 Install Ubuntu
@@ -75,7 +81,7 @@ OpenSSH lets you work from another machine on the LAN; the rest are standard dev
 
 ```bash
 sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
-  bridge-utils virt-manager virtinst libosinfo-bin
+  bridge-utils virt-manager virtinst virt-viewer libosinfo-bin cpu-checker
 ```
 
 | Package | Purpose |
@@ -86,7 +92,9 @@ sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
 | `bridge-utils` | Network bridge utilities |
 | `virt-manager` | GUI for VM management |
 | `virtinst` | `virt-install` CLI for creating VMs |
+| `virt-viewer` | Lightweight VM console viewer |
 | `libosinfo-bin` | OS variant database used by virt-install |
+| `cpu-checker` | Provides `kvm-ok` for checking KVM acceleration |
 
 ### 1.7 Add User to Groups
 
@@ -102,18 +110,17 @@ Log out and back in (or reboot) for group membership to take effect. This lets y
 Run each command and confirm the expected output:
 
 ```bash
-# KVM modules loaded — should see kvm_intel and kvm
+# KVM modules loaded — should see kvm plus either kvm_intel or kvm_amd
 lsmod | grep kvm
 
 # KVM acceleration available — should say "KVM acceleration can be used"
 kvm-ok
-# (if kvm-ok not found: sudo apt install cpu-checker)
 
-# VT-x confirmed at CPU level — should show vmx flags
+# CPU virtualization flag present — vmx = Intel VT-x, svm = AMD-V
 grep -E 'vmx|svm' /proc/cpuinfo | head -1
 
-# libvirtd running
-systemctl status libvirtd
+# libvirt daemon running
+systemctl status libvirtd || systemctl status virtqemud
 
 # libvirt and QEMU versions
 virsh version
@@ -144,7 +151,7 @@ virsh net-list --all
 
 ```bash
 mkdir -p ~/darkagents-downloads && cd ~/darkagents-downloads
-wget https://releases.ubuntu.com/24.04/ubuntu-24.04.2-live-server-amd64.iso
+wget https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso
 wget https://sourceforge.net/projects/metasploitable/files/Metasploitable2/metasploitable-linux-2.0.0.zip/download -O metasploitable-linux-2.0.0.zip
 unzip metasploitable-linux-2.0.0.zip
 
@@ -173,11 +180,12 @@ virsh net-update default add ip-dhcp-host \
 bash infra/01-create-isolated-network.sh
 ```
 
-Defines `darkagents-isolated`: a libvirt bridge with no `<forward>` element (no routing to host or LAN), with DHCP reservations pinning the attacker and target to fixed IPs.
+Defines `darkagents-isolated`: a libvirt bridge with no `<forward>` element. This means the network does not forward traffic to the LAN or internet. Guests on this network can communicate with each other, and they may also be able to reach the host-side bridge IP (`192.168.56.1`) unless you add separate host firewall rules.
 
 Verify:
 ```bash
 virsh net-list --all
+virsh net-dumpxml darkagents-isolated
 ip link show virbr-iso
 ```
 
@@ -209,6 +217,17 @@ After installation, SSH in from the host:
 ssh <your-username>@192.168.122.10
 ```
 
+Inside the attacker VM, verify both NICs and routes:
+```bash
+ip -br addr show
+ip route
+
+# Expected shape:
+# default via 192.168.122.1 dev <NAT_NIC>
+# 192.168.122.0/24 dev <NAT_NIC>
+# 192.168.56.0/24 dev <ISO_NIC>
+```
+
 ---
 
 ### Step 3 — Install Packages on Attacker VM (Attacker VM, via SSH)
@@ -219,7 +238,11 @@ ssh <your-username>@192.168.122.10
 bash infra/03-attacker-post-install.sh
 ```
 
-Installs: `nmap`, `nikto`, `snmp`, `netcat-openbsd`, `curl`, `dnsutils`, `whois`, `tcpdump`, `tmux`, Python dev tools, and `iptables-persistent`.
+Installs recon tooling (`nmap`, `nikto`, `snmp`, `netcat-openbsd`, `curl`, `dnsutils`, `whois`, `tcpdump`, `tmux`, `git`), Python dev packages (`python3-pip`, `python3-venv`, `python3-dev`, `build-essential`), the `uv` project/package manager (into `~/.local/bin` via the official installer), and `iptables-persistent`.
+
+> **Run as the operator user, not root.** The script installs `uv` into the operator's `~/.local/bin`; running the whole script under `sudo` would land `uv` in `/root/.local/bin` instead and break the agent's `uv run` invocations. The script refuses to run as root.
+>
+> After it finishes, either start a fresh SSH session or run `source ~/.local/bin/env` in the current session so `uv` is on `PATH`.
 
 > **Note:** `enum4linux` is unavailable in Ubuntu 24.04 repos. Install `enum4linux-ng` via pip if needed.
 
@@ -231,7 +254,7 @@ Installs: `nmap`, `nikto`, `snmp`, `netcat-openbsd`, `curl`, `dnsutils`, `whois`
 bash infra/04-create-target-vm.sh
 ```
 
-Imports Metasploitable 2 as `darkagents-target` (1 GB RAM, 1 vCPU) on the isolated network only. Uses `bus=ide` and `model=e1000` because the old kernel (2.6.24) lacks VirtIO drivers.
+Imports Metasploitable 2 as `darkagents-target` (1 GB RAM, 1 vCPU) on the isolated network only. Uses `bus=ide` and `model=e1000` for maximum compatibility with the old Metasploitable 2 image and kernel. Do not switch this VM to VirtIO unless you have tested it on a clone.
 
 Verify it boots:
 ```bash
@@ -258,8 +281,9 @@ Confirms that before iptables is applied:
 Also verify target isolation manually via `virt-viewer darkagents-target`:
 ```bash
 ping -c 2 192.168.56.10   # PASS (can reach attacker)
-ping -c 2 192.168.122.1   # FAIL (no route to NAT network)
-ping -c 2 1.1.1.1          # FAIL (no internet)
+ping -c 2 192.168.56.1    # MAY PASS (host-side bridge IP for isolated network)
+ping -c 2 192.168.122.1   # FAIL (target is not attached to NAT network)
+ping -c 2 1.1.1.1          # FAIL (no internet forwarding)
 ```
 
 ---
@@ -279,10 +303,12 @@ ipconfig getifaddr en0   # or en1 for Wi-Fi
 Apply the lockdown:
 ```bash
 sudo bash infra/06-setup-iptables.sh <NAT_NIC> <INFERENCE_IP>
-# Example: sudo bash infra/06-setup-iptables.sh enp1s0 192.168.1.50
+# Example (this lab): sudo bash infra/06-setup-iptables.sh enp1s0 192.168.1.182
+# Replace `enp1s0` with whatever the previous `ip -br addr show` reported, and
+# replace `192.168.1.182` with your own Mac's LAN IP from `ipconfig getifaddr`.
 ```
 
-Locks the NAT interface to only allow TCP to the inference server on port 11434 and DHCP. Saves config to `/etc/darkagents/inference.conf` for use by helper scripts.
+Locks outbound traffic on the NAT interface to only allow TCP to the inference server on port 11434 and DHCP. The script should not block established traffic or SSH management unless you are prepared to use `virt-manager` / `virt-viewer` console access instead. Saves config to `/etc/darkagents/inference.conf` for use by helper scripts.
 
 ---
 
@@ -303,6 +329,12 @@ Expected results:
 | Attacker → Inference IP:11434 | PASS (or timeout if Ollama not yet running) |
 | DNS to 8.8.8.8 | BLOCKED |
 
+If you intend to keep SSH management available from the host, verify it from the host after lockdown:
+```bash
+ssh <your-username>@192.168.122.10
+# Expected: PASS, unless you intentionally made the VM console-only after lockdown
+```
+
 ---
 
 ### Step 8 — Take Baseline Snapshots (Host)
@@ -311,15 +343,19 @@ Expected results:
 bash infra/08-take-snapshot.sh
 ```
 
-Takes external, disk-only snapshots of both VMs for easy rollback. External disk-only snapshots are required because internal snapshots do not support UEFI firmware VMs in libvirt. Uses `--disk-only --atomic`.
+Creates external, disk-only baseline snapshots of both VMs. In this workflow, the snapshot becomes the saved baseline point and later VM changes are written into external overlay files.
 
-Revert later with:
+Check what snapshots exist:
 ```bash
-virsh snapshot-revert darkagents-attacker baseline-post-setup
-virsh snapshot-revert darkagents-target baseline-clean
+virsh snapshot-list darkagents-attacker
+virsh snapshot-list darkagents-target
 ```
 
----
+Inspect the active disk files if needed:
+```bash
+virsh domblklist --details darkagents-attacker
+virsh domblklist --details darkagents-target
+```
 
 ## Helper Scripts
 
@@ -372,9 +408,11 @@ cat /etc/iptables/rules.v4
 **Can't SSH to attacker VM**
 ```bash
 virsh net-dhcp-leases default          # confirm 192.168.122.10 is leased
-virsh list --all                        # confirm VM is running
-virsh start darkagents-attacker         # start if needed
+virsh list --all                       # confirm VM is running
+virsh start darkagents-attacker        # start if needed
 ```
+
+If this only fails after lockdown, use `virt-manager` / `virt-viewer` console access and inspect the VM firewall rules.
 
 ---
 
@@ -392,3 +430,10 @@ virsh start darkagents-attacker         # start if needed
 | `08-take-snapshot.sh` | Host | Baseline snapshots | No |
 | `09-update-inference-ip.sh` | Attacker VM | Update inference server IP | No |
 | `10-temp-open-firewall.sh` | Attacker VM | Temporarily open/close firewall | Opens temporarily |
+| `11-install-ollama.sh` | Mac (inference server) | Verify Ollama CLI and server after manual install | No |
+| `12-start-ollama-session.sh` | Mac (inference server) | Start Ollama bound to `0.0.0.0:11434` so the attacker VM can reach it | No |
+| `13-test-structured-output.sh` | Mac or any host reachable to Ollama | Verify the configured model returns valid structured JSON | No |
+| `14-verify-connectivity.sh` | Attacker VM | Confirm Ollama reachable through NAT and isolation blocks everything else | No |
+| `15-stop-ollama-session.sh` | Mac (inference server) | Unload models, quit Ollama, free GPU memory | No |
+
+After lab setup is complete, see [`docs/porting-guide.md`](./porting-guide.md) for porting the reconnaissance agent onto the attacker VM.
