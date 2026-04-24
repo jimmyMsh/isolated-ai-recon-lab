@@ -12,6 +12,9 @@ output_dir: "./output"
 allowed_tools:
   - "nmap"
 
+# Current implementation executes the fixed four-stage pipeline below.
+# This list is loaded and displayed by dry-run/reports, but it is not yet
+# an operator-facing mechanism for reordering or disabling stages.
 pipeline_stages:
   - "host_discovery"
   - "port_scan"
