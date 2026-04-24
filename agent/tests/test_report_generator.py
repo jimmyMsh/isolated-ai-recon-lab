@@ -486,6 +486,33 @@ class TestExecutiveSummary:
         assert "stage failure" not in report.lower()
 
 
+def test_executive_summary_interrupted_run(config, sample_state):
+    """When state.errors carries an operator_interrupt entry, the Executive
+    Summary must say the run was interrupted using internally consistent
+    units (configured stages completed against configured stages expected),
+    rather than 'All pipeline stages completed successfully' or the generic
+    'failure/skip event(s)' wording.
+    """
+    state = sample_state
+    state.stages_completed = ["host_discovery", "port_scan"]
+    state.errors.append(
+        {
+            "stage": "service_enum",
+            "host": None,
+            "reason": "operator_interrupt",
+            "detail": "run interrupted by operator",
+        }
+    )
+    _write_synthetic_log(config.log_file, TRACE_ID)
+    gen = ReportGenerator(config)
+    path = gen.generate(state, config.log_file, trace_id=TRACE_ID)
+    report = Path(path).read_text()
+    total = len(config.pipeline_stages)
+    assert f"Pipeline was interrupted after 2 of {total} stages completed." in report
+    assert "All pipeline stages completed successfully" not in report
+    assert "Pipeline completed with 1 failure/skip event(s)." not in report
+
+
 # ---------------------------------------------------------------------------
 # TestScopeSection
 # ---------------------------------------------------------------------------

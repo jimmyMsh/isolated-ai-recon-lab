@@ -779,6 +779,64 @@ class TestRunLevelUnexpectedException:
 
 
 # =======================================================================
+# Run-level KeyboardInterrupt (operator_interrupt)
+# =======================================================================
+
+
+@pytest.fixture()
+def operator_interrupt_run(config, monkeypatch):
+    """host_discovery runs; then the stage loop raises KeyboardInterrupt.
+    Pipeline records an operator_interrupt error event and a matching
+    state.errors entry, then re-raises so the caller exits 130. The report
+    is still produced from the finally block.
+    """
+    llm = FakeLLMClient([_planning_response(), _interpretation_response()])
+    tool = FakeToolExecutor(
+        results=[(FIXTURES_DIR / "host_discovery.xml", _exec_result_ok(["/usr/bin/nmap", "-sn"]))],
+        output_dir=Path(config.output_dir),
+    )
+    agent, logger = _build_agent(config, llm, tool)
+    trace_id = logger.trace_id
+
+    def operator_sigint(stage):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "_run_per_host_stage_loop", operator_sigint)
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.run()
+
+    events = _events_for_run(config, trace_id)
+    return {
+        "agent": agent,
+        "events": events,
+        "state": agent._state,
+    }
+
+
+def test_run_appends_operator_interrupt_on_sigint(operator_interrupt_run):
+    state_errors = operator_interrupt_run["state"].errors
+    matching_state = [e for e in state_errors if e["reason"] == "operator_interrupt"]
+    assert len(matching_state) == 1
+    entry = matching_state[0]
+    assert entry["stage"] == "port_scan"
+    assert entry["host"] is None
+    assert entry["detail"] == "run interrupted by operator"
+
+    events = operator_interrupt_run["events"]
+    matching_events = [
+        e
+        for e in events
+        if e["event_type"] == "error" and e.get("error_type") == "operator_interrupt"
+    ]
+    assert len(matching_events) == 1
+    err = matching_events[0]
+    assert err["action_taken"] == "generate_partial_report"
+    assert err["detail"] == "run interrupted by operator"
+    assert err["stage"] == "port_scan"
+
+
+# =======================================================================
 # Logger close exactly once, even when report generation itself raises
 # =======================================================================
 
