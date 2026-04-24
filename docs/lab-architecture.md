@@ -1,6 +1,6 @@
-# Dark Agents — Midpoint Review (Phases 1–3)
+# Dark Agents — Lab Architecture and Design Notes
 
-Reference document for the project review covering host setup, network architecture, and inference server configuration. Talking points are in normal text; supporting detail for later reference is in blockquotes and code blocks.
+Standing reference for the lab's physical and virtual layout: host setup, network topology, the dual-layer isolation model, and the inference server design. Read this to understand *why* the lab is structured the way it is; see [`docs/infra-setup-guide.md`](./infra-setup-guide.md) for step-by-step bring-up and [`docs/porting-guide.md`](./porting-guide.md) for porting the agent onto the attacker VM. Supporting detail and example commands are in blockquotes and code blocks.
 
 ---
 
@@ -8,7 +8,11 @@ Reference document for the project review covering host setup, network architect
 
 **Why KVM instead of VirtualBox:** On Ubuntu 24.04, the KVM kernel module loads by default and claims VT-x. VirtualBox cannot acquire VT-x when KVM holds it. Rather than fighting the kernel, we use KVM — a Type 1 hypervisor built into Linux, standard in production and cloud environments.
 
-> **Host specs:**
+> **What's prescriptive vs. what's mine:**
+> *Prescriptive (don't change without re-validating the lab):* Ubuntu 24.04 host, KVM/libvirt stack, the libvirt subnets / MACs / VM IPs, and the iptables rule shape.
+> *My setup, shown for transparency — substitute your own:* the host hardware, hostname, Wi-Fi NIC name, and host LAN IP listed below; the Mac inference server's LAN IP wherever it appears in this doc.
+
+> **Host specs (this lab — your hardware will differ):**
 > - Ubuntu 24.04.4 LTS (kernel 6.17.0-14-generic)
 > - QEMU 8.2.2, libvirt 10.0.0
 > - Intel i7-8850H, Quadro P600 (GPU unused — no local inference)
@@ -36,7 +40,7 @@ virsh net-list --all      # shows default + darkagents-isolated
 
 The attacker VM straddles two networks. The target VM is on the isolated network only.
 
-- **Isolated network** (`darkagents-isolated`, `192.168.56.0/24`): No `<forward>` element in the libvirt XML — traffic stays on the bridge. The target has no route out. This is where recon happens.
+- **Isolated network** (`darkagents-isolated`, `192.168.56.0/24`): No `<forward>` element in the libvirt XML — traffic stays on the bridge. The target has no forwarded or routed path to the LAN or internet. This is where recon happens.
 - **NAT network** (`default`, `192.168.122.0/24`): Provides outbound access through the host's IP via masquerading. Used exclusively for reaching the inference server.
 
 > **IP/MAC Reference:**
@@ -47,7 +51,7 @@ The attacker VM straddles two networks. The target VM is on the isolated network
 > | Target | `52:54:00:DA:01:01` | `192.168.56.101` | darkagents-isolated |
 > | Libvirt gateway (NAT) | — | `192.168.122.1` | default NAT |
 > | Libvirt gateway (Isolated) | — | `192.168.56.1` | darkagents-isolated |
-> | Inference server (Mac) | — | `192.168.1.182` (DHCP) | Home LAN |
+> | Inference server (Mac) | — | `192.168.1.182` (DHCP — *this lab; yours will differ*) | Home LAN |
 
 ### Why NAT Instead of Bridging
 
@@ -88,8 +92,8 @@ Five rules on the OUTPUT chain, scoped to the NAT interface only:
 These rules only apply to the NAT interface (`enp1s0`). The isolated interface has no iptables rules — it is completely open for recon. The OUTPUT chain's default policy is ACCEPT (not DROP), so traffic on the isolated interface and localhost passes through unaffected. Rules 3-4 keep DHCP working so the VM retains its IP after lease renewal.
 
 > **What each rule does:**
-> - **Rule 1 (ESTABLISHED,RELATED):** If the VM started a connection (e.g., sent a prompt to Ollama), allow the response packets back through. Standard stateful firewall behavior.
-> - **Rule 2 (NEW TCP to inference:11434):** The single pinhole — allow new outbound connections, but only to the Ollama server on its specific port. Nothing else.
+> - **Rule 1 (ESTABLISHED,RELATED):** Allows locally generated outbound packets that are part of an already-established connection on the NAT NIC. Inbound response packets from Ollama traverse the VM's `INPUT` chain, not `OUTPUT`, and are allowed because this lab leaves `INPUT` at its default ACCEPT policy.
+> - **Rule 2 (NEW TCP to inference:11434):** The single pinhole — allow new outbound connections, but only to the Ollama server on its specific IP and port. Nothing else.
 > - **Rules 3-4 (DHCP):** Allow the VM to request and renew its IP address. Port 68 (client) → port 67 (server). Rule 3 is the initial broadcast discovery; rule 4 is direct renewal to the known gateway.
 > - **Rule 5 (DROP):** Block all other outbound traffic on the NAT interface. No internet, no DNS, no LAN scanning.
 > - **Default policy ACCEPT:** The DROP in rule 5 targets only the NAT interface. The chain's default is ACCEPT so that isolated-network traffic (recon) and localhost traffic pass through with no restrictions.
@@ -98,13 +102,14 @@ These rules only apply to the NAT interface (`enp1s0`). The isolated interface h
 > - No DNS allowed — the agent addresses the inference server by IP directly
 > - Rules persist across reboots via `netfilter-persistent`
 > - Inference server IP saved to `/etc/darkagents/inference.conf` for helper scripts
+> - These rules describe IPv4 filtering. If IPv6 is enabled on the attacker VM's NAT interface, add equivalent `ip6tables`/nftables rules or disable IPv6 to avoid an unintended bypass.
 
 ### Attacker VM (`darkagents-attacker`)
 
 - Ubuntu 24.04 Server (no GUI — lighter footprint, SSH access from host)
 - 8 GB RAM, 4 vCPUs, 40 GB disk, UEFI boot
-- Two NICs: NAT (`enp1s0`) + Isolated (`enp2s0`)
-- Installed tools: nmap, nikto, snmp, netcat, curl, dnsutils, whois, tcpdump, tmux, Python 3 dev stack
+- Two NICs: NAT (`enp1s0`) + Isolated (`enp2s0`) — names assigned by Ubuntu's `systemd-udev` from PCI bus position; in practice the NAT NIC ends up as `enp1s0` and the isolated NIC as `enp2s0` because of the `--network` order in `infra/02-create-attacker-vm.sh`. Confirm with `ip -br addr show` on the live VM rather than relying on the names.
+- Installed tools: nmap, nikto, snmp, netcat, curl, dnsutils, whois, tcpdump, tmux, git, uv, Python 3 dev stack, and iptables-persistent
 
 > **Packages-before-lockdown ordering:** Once iptables locks the NAT interface, `apt` can't reach mirrors. All packages must be installed before lockdown (script 03). `10-temp-open-firewall.sh` exists as an escape hatch for later installs.
 
@@ -112,7 +117,7 @@ These rules only apply to the NAT interface (`enp1s0`). The isolated interface h
 
 - Metasploitable 2 (Ubuntu 8.04, kernel 2.6.24)
 - 1 GB RAM, 1 vCPU, IDE disk bus + e1000 NIC (old kernel lacks VirtIO drivers)
-- Isolated network only — no route out, no internet, no LAN
+- Isolated network only — no forwarded or routed path to the LAN or internet
 - Login: `msfadmin/msfadmin` — intentionally vulnerable, never patched
 
 ### Baseline Snapshots
@@ -121,7 +126,7 @@ External, disk-only snapshots via `--disk-only --atomic`:
 - `darkagents-attacker`: `baseline-post-setup`
 - `darkagents-target`: `baseline-clean`
 
-> External disk-only snapshots are required because libvirt's internal snapshots do not support UEFI firmware VMs.
+> External disk-only snapshots were used because this lab's libvirt/UEFI configuration does not reliably support internal snapshots for pflash-based UEFI VMs. This is a practical compatibility choice for the current host stack.
 
 **Demo commands (host):**
 ```bash
@@ -147,12 +152,13 @@ ping -c 1 -W 2 1.1.1.1                         # blocked (NAT locked)
 ### Model Selection: Qwen3 8B
 
 Selected `qwen3:8b` (Q4_K_M quantization, ~5 GB on disk) for:
-- Top-ranked tool calling in Docker's practical evaluation of local LLMs
-- Structured JSON output enforced server-side via Ollama's `format` parameter
-- 32K context window (vs Llama 3.1's 16K) — more room for accumulated scan results
-- Less aggressive safety filters for recon task prompts (Apache 2.0 license)
+- Strong local tool-calling performance in Docker's practical evaluation of local LLMs
+- Good schema-following behavior with Ollama's `format` parameter
+- 40K context window as packaged by Ollama (set explicitly via `options.num_ctx`) — enough room for accumulated scan results in this POC
+- Less aggressive refusal behavior for benign recon-planning prompts
+- Apache 2.0 license
 
-> **Why not Llama 3.1 8B:** Meta's safety training is more aggressive — meaningful risk of refusing nmap/recon commands even with a well-crafted system prompt. Also has a smaller context window (16K vs 32K).
+> **Why not Llama 3.1 8B:** Llama 3.1 8B has a larger documented model context window than Qwen3 8B, so context size is **not** the reason it was rejected. The lab chose Qwen3 8B primarily for local tool-calling behavior, schema-following behavior, and observed willingness to comply with benign recon-planning prompts. Context in Ollama should be controlled  through `options.num_ctx` rather than relying on model defaults.
 
 > **Fallback model:** `qwen2.5:7b` — slightly smaller, faster, battle-tested longer. Available if Qwen3 proves problematic.
 
@@ -165,7 +171,15 @@ Selected `qwen3:8b` (Q4_K_M quantization, ~5 GB on disk) for:
 
 ### Structured Output
 
-Ollama's `format` parameter accepts a JSON schema and enforces it server-side via grammar-guided generation. Output is guaranteed valid JSON matching the schema — the model cannot produce malformed responses. This is what the agent will use to get structured commands from the LLM.
+Ollama's `format` parameter accepts a JSON schema and constrains generation toward schema-matching JSON. This is what the agent will use to get structured planning output from the LLM.
+
+The agent should still validate every response before execution:
+- The output must parse as JSON
+- The JSON must match the expected schema
+- The requested operation must be in the agent's allowlist
+- The target, ports, intensity, and tool arguments must pass local guardrails
+
+Schema-valid JSON is not the same as safe or authorized behavior.
 
 > **Example:** The schema can constrain `operation` to an enum like `["host_discovery", "port_scan", "service_enum", "os_fingerprint"]` and require fields like `tool`, `command_args`, and `reasoning`.
 
@@ -176,11 +190,11 @@ Qwen3 defaults to thinking ON — it reasons through decisions before responding
 | Mode | Response Time | Notes |
 |---|---|---|
 | Thinking ON | ~14-17s | Better reasoning quality; raw generation ~40 tok/s |
-| Thinking OFF | ~2-5s | Append `/no_think` to user message |
+| Thinking OFF | ~2-5s | Use Qwen's `/no_think` switch or Ollama's API-level thinking controls when available |
 
-> **Context window:** Ollama defaults to 2048 tokens. The agent should set 4096-8192 via the `options.num_ctx` parameter. Larger context uses more memory (KV cache grows linearly).
+> **Context window:** Do not rely on Ollama's implicit context default. The agent should set `4096-8192` explicitly via the `options.num_ctx` parameter. Larger context uses more memory because the KV cache grows with context length.
 
-> **Model memory footprint:** ~6-7 GB total (5 GB weights + KV cache at 4K context). Fits comfortably on a 16 GB+ Apple Silicon Mac.
+> **Model memory footprint:** ~6-7 GB total at moderate context sizes (5 GB weights + KV cache). Fits comfortably on a 16 GB+ Apple Silicon Mac.
 
 ### Session Workflow
 
@@ -188,16 +202,18 @@ Qwen3 defaults to thinking ON — it reasons through decisions before responding
 2. **If Mac IP changed:** `sudo bash infra/09-update-inference-ip.sh <NEW_IP>` on attacker VM
 3. **End session (Mac):** `bash infra/15-stop-ollama-session.sh` — unloads models, stops server, frees memory
 
-### End-to-End Verification (All Passed)
+### Expected End-to-End Verification
 
-| Test | Result |
+Run `infra/14-verify-connectivity.sh` from the attacker VM after Ollama is listening and the inference IP is current. A correctly configured lab should produce these outcomes:
+
+| Test | Expected |
 |---|---|
 | Attacker → Ollama (curl + generation) | PASS |
 | Structured JSON output (schema-constrained) | PASS |
 | Attacker → Internet (post-lockdown) | BLOCKED |
 | Attacker → DNS | BLOCKED |
 | Attacker → LAN scan | BLOCKED |
-| Target → Internet | BLOCKED (no route) |
+| Target → Internet | BLOCKED (no forwarding to LAN or internet) |
 | Non-inference ports on Mac | BLOCKED |
 | Target reachable on isolated network | PASS |
 
@@ -212,25 +228,6 @@ bash infra/13-test-structured-output.sh  # 3 tests: basic JSON, schema-constrain
 ```bash
 bash infra/14-verify-connectivity.sh  # 8-test suite: inference works + everything else blocked
 ```
-
----
-
-## Next Steps
-
-With the infrastructure verified end-to-end, the remaining work focuses on the autonomous agent itself.
-
-**MITRE ATT&CK mapping** — Research the specific reconnaissance techniques (from the MITRE ATT&CK framework) that apply to the target environment, and map them to concrete tool commands the agent can execute (nmap scans, service enumeration, OS fingerprinting, etc.).
-
-**Agent design and logging** — Design the agent's decision loop: how it receives scan results, reasons about what to do next via the LLM, and selects the next operation. This includes defining the structured schemas the LLM will respond with, the prompt engineering strategy, and a logging specification so every agent action, LLM response, and scan result is recorded for analysis and reproducibility.
-
-**Implementation** — Build and test the agent on the attacker VM, running against the target through the verified infrastructure.
-
-> **More detail for reference:**
-> - The agent will run as a Python process on the attacker VM, sending prompts to Ollama over the NAT network and executing recon tools on the isolated network
-> - Each agent "cycle" is: observe scan results → send to LLM with context → receive structured JSON command → execute tool → log everything → repeat
-> - Thinking mode (ON/OFF) will be tuned per operation type — complex decisions (what to scan next) may benefit from thinking, while simple parsing does not
-> - Logging captures the full chain: raw LLM responses (including thinking), tool commands executed, tool output, and timing — enabling post-hoc analysis of the agent's reasoning
-> - The baseline snapshots (script 08) allow resetting the target to a clean state between test runs
 
 ---
 
@@ -269,10 +266,10 @@ graph LR
         NAT["NAT Network · virbr0<br/>192.168.122.0/24<br/>masquerades to LAN"]
         ATK["Attacker VM · Ubuntu 24.04<br/>enp1s0: .122.10 (NAT)<br/>enp2s0: .56.10 (Isolated)<br/><b>iptables: NAT → inference only</b>"]
         ISO["Isolated Network · virbr-iso<br/>192.168.56.0/24<br/>no forwarding"]
-        TGT["Target VM · Metasploitable 2<br/>192.168.56.101<br/><i>no route out</i>"]
+        TGT["Target VM · Metasploitable 2<br/>192.168.56.101<br/><i>no LAN/internet route</i>"]
     end
 
-    MAC -- "TCP :11434 only<br/>(NAT masquerade)" --> NAT
+    MAC -- "TCP :11434 only<br/>(NAT masquerade)" --- NAT
     NAT --- ATK
     ATK -- "unrestricted recon" --> ISO
     ISO --- TGT
@@ -284,4 +281,4 @@ graph LR
     style ISO fill:#fdd,stroke:#a88
 ```
 
-> **Key visual story:** The attacker VM is the only component that touches both networks. Its NAT side is locked to a single IP:port (Ollama). The target is completely walled off. Only the Mac's DHCP IP is variable — everything inside the libvirt boundary is stable and deterministic.
+> **Key visual story:** The attacker VM is the only component that touches both networks. Its NAT side is locked so it can initiate traffic only to the Mac's Ollama IP:port. The target is completely walled off on the isolated network. Because the attacker reaches the Mac through libvirt NAT/masquerade, the Mac  sees the connection as coming from `DarkHost`'s LAN IP, not the attacker's `192.168.122.10` address. Only the Mac's DHCP IP is variable — everything inside the libvirt boundary is stable and deterministic.
