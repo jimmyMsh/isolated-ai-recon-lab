@@ -79,7 +79,7 @@ If you have the macOS firewall enabled, allow incoming connections for Ollama wh
 
 ### Hardware Sizing
 
-Apple Silicon Macs use unified memory — the same RAM serves as VRAM. Ollama defaults to Q4_K_M quantization, which balances quality, speed, and memory. Reserve ~4-6GB for macOS and apps; the rest is available for inference.
+Apple Silicon Macs use unified memory — the same RAM serves as VRAM. The default Ollama tags used here are Q4_K_M quantized, which balances quality, speed, and memory. Reserve ~4-6GB for macOS and apps; the rest is available for inference.
 
 | Available RAM | Max Model Size (Q4_K_M) | Recommended Models | Approx. Speed |
 |---|---|---|---|
@@ -88,39 +88,37 @@ Apple Silicon Macs use unified memory — the same RAM serves as VRAM. Ollama de
 | **20-28GB** (e.g., 32GB Mac) | 27-32B | `qwen3:32b`, `gemma3:27b` | 5-12 tok/s |
 | **48GB+** (e.g., 64GB Mac/Studio) | 70B+ | `llama3.3:70b`, `qwen2.5:72b` | 3-8 tok/s |
 
-Speed varies by chip variant — M3 Pro/Max with more GPU cores runs ~2x faster than M1 base at the same model size. Context window size also affects memory: at default 2048 tokens the KV cache is small, but at 32K context an 8B model uses ~4.5GB additional for KV cache alone.
+Speed varies by chip variant — M3 Pro/Max with more GPU cores runs ~2x faster than M1 base at the same model size. Context window size also affects memory: the KV cache grows with context length, and at 32K context an 8B model uses ~4.5GB additional for KV cache alone. Ollama picks a default context length based on available VRAM/unified memory (see "Adjustments" below to set it explicitly).
 
 ### Model Comparison for Recon Agent Use
 
-| Model | Size (Q4) | Tool Calling | JSON Output | Context | Security Task Compliance |
-|---|---|---|---|---|---|
-| **Qwen3 8B** | ~5GB | Excellent | Excellent | 32K | Good — less restrictive for recon |
-| Qwen 2.5 7B | ~4.7GB | Very good | Very good | 32K | Good |
-| Llama 3.1 8B | ~4.7GB | Good | Good | 16K | More restrictive — may refuse recon |
-| Mistral 7B v0.3 | ~4.1GB | Decent | Decent | 32K | Less restrictive |
+| Model | Size (default Ollama tag) | Structured-output fit | Ollama-listed context | Project note |
+|---|---:|---|---:|---|
+| **Qwen3 8B** | ~5.2GB, Q4_K_M | Primary observed model; still requires parse, retry, and guardrails | 40K | Used for current runtime findings; validate behavior from JSONL logs and reports |
+| Qwen2.5 7B | ~4.7GB, Q4_K_M | Candidate fallback; validate against the same prompts before relying on it | 32K | Smaller alternative if memory or speed is tight |
+| Llama 3.1 8B | ~4.9GB, Q4_K_M | Candidate fallback; validate structured output and refusal behavior locally | 128K | Larger advertised context than Qwen3 in Ollama, but behavior must be tested |
+| Mistral 7B v0.3 | ~4.4GB, Q4_K_M | Candidate fallback; validate structured output locally | 32K | Lightweight option for constrained hardware |
 
 ### What This Project Uses
 
 **Primary: `qwen3:8b`** — Selected for this project because:
-- Top-ranked tool calling in Docker's practical evaluation of local LLMs
-- Strong structured JSON via Ollama's `format` parameter with schema enforcement
-- 32K context window (vs 16K for Llama 3.1) — more room for accumulated scan results
-- Less aggressive safety filters for security tooling compared to Meta's Llama models
+- Structured JSON support via Ollama's `format` parameter
+- 40K context window as packaged by Ollama (Llama 3.1 8B's tag is larger at 128K, but Qwen3's structured-output and recon-planning behavior fit this lab better)
+- Runtime observations show it will attempt the lab's recon planning tasks, with guardrails catching invalid parameters
 - Apache 2.0 license
 
 At Q4_K_M quantization (~5GB weights), total memory usage is ~6-7GB with a 4K context window. Fits comfortably on a 16GB+ Mac with moderate other usage.
 
-**Thinking mode:** Qwen3 has thinking ON by default — it reasons through decisions before responding. This adds ~10-12s latency but improves quality. Disable with `/no_think` appended to the user message when speed matters more than reasoning.
+**Thinking mode:** Qwen3 has thinking ON by default — it reasons through decisions before responding. This adds latency and can improve some free-form reasoning tasks. The current agent does not use thinking mode for planning or interpretation: it sends schema-constrained `/api/chat` requests with `think: false`, `stream: false`, and `/no_think` in the prompt text so responses stay structured and concise.
 
-**Fallback: `qwen2.5:7b`** — Slightly smaller, slightly faster, battle-tested longer. Strong tool-calling and JSON support but weaker reasoning.
+**Fallback candidate: `qwen2.5:7b`** — Slightly smaller and often faster. Validate it against the same planning and interpretation prompts before relying on it for this agent.
 
 ### Adjustments
 
-- **More RAM available?** Try `qwen3:14b` on a 24GB+ Mac — better reasoning and structured output, but slower (~10-15 tok/s).
+- **More RAM available?** Try `qwen3:14b` on a 24GB+ Mac and compare its planning quality against `qwen3:8b`; expect slower responses (~10-15 tok/s).
 - **Speed is critical?** Use `qwen2.5:7b` or disable thinking mode (`/no_think`).
-- **Different quantization?** Ollama pulls Q4_K_M by default. For higher quality on machines with headroom: `ollama pull qwen3:8b:q8_0` (~8.5GB, noticeably better output at the cost of speed and memory).
-- **Context window:** Ollama defaults to 2048 tokens (`num_ctx`). Set 4096-8192 via the `options` parameter for agent use. Larger context = more KV cache memory, so 4096 is a safe starting point.
-
+- **Different quantization?** Ollama pulls Q4_K_M by default. For higher quality on machines with headroom: `ollama pull qwen3:8b-q8_0` (~8.9GB, noticeably better output at the cost of speed and memory).
+- **Context window:** Current Ollama versions choose a default context length based on available VRAM/unified memory. On machines with less than 24 GiB available VRAM, Ollama defaults to ~4K context; with 24–48 GiB it defaults to ~32K; with 48 GiB+ it may default to ~256K. For predictable agent behavior, explicitly set `num_ctx` in the API `options` field, e.g. 4096 or 8192 to start.
 ---
 
 ## Part 4: Pulling the Model
@@ -166,7 +164,15 @@ curl -s http://localhost:11434/api/chat \
   }' | python3 -m json.tool
 ```
 
-The `"format"` parameter with a JSON schema tells Ollama to constrain output via grammar-guided generation — output is guaranteed valid JSON matching the schema.
+The `"format"` parameter with a JSON schema tells Ollama to constrain output
+toward the schema using Ollama’s structured-output/constrained-output support. The agent still parses,
+validates, retries, and guardrails responses because schema-shaped output can
+still be semantically invalid.
+
+This smoke test verifies API reachability and structured-output capability. It
+does not prove that the model will make good reconnaissance decisions in a full
+run. Runtime behavior should still be reviewed from the JSONL log and generated
+report after an end-to-end agent run.
 
 ---
 
@@ -225,11 +231,19 @@ curl -s --connect-timeout 5 http://<HOST_LAN_IP>:80  # non-inference ports block
 
 ---
 
-## Appendix A: Persistent Auto-Start Configuration
+## Appendix A: Re-apply Ollama Network Environment at Login
 
-For a dedicated inference machine where Ollama should start at login and listen on all interfaces:
+The Ollama macOS app reads `OLLAMA_HOST` from its launchd environment when it starts. Setting it once with `launchctl setenv` only lasts for the current login session. This LaunchAgent re-applies `launchctl setenv OLLAMA_HOST` at every user login so the Ollama app inherits it when you open it.
+
+**This LaunchAgent does not start Ollama.** It only sets the environment variable. Open the Ollama app yourself (Login Item, Dock, Spotlight) — it will pick up the value on launch. If Ollama is set as a Login Item, quit and reopen it after login to avoid a startup race with the environment job.
+
+> **Note:** A LaunchAgent runs at GUI login, not at system boot. If you need the Ollama API reachable before any user logs in (true headless server), use `brew install ollama` + `brew services start ollama` instead — that installs a LaunchDaemon that runs the `ollama` binary directly with the env var baked in.
+
+### Install
 
 ```bash
+mkdir -p ~/Library/LaunchAgents
+
 cat > ~/Library/LaunchAgents/com.darkagents.ollama-env.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -250,13 +264,37 @@ cat > ~/Library/LaunchAgents/com.darkagents.ollama-env.plist << 'EOF'
 </plist>
 EOF
 
-launchctl load ~/Library/LaunchAgents/com.darkagents.ollama-env.plist
+# Validate
+plutil -lint ~/Library/LaunchAgents/com.darkagents.ollama-env.plist
+
+# Load into the current GUI session (modern replacement for `launchctl load`)
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.darkagents.ollama-env.plist
+
+# Run it now instead of waiting for next login
+launchctl kickstart -k "gui/$(id -u)/com.darkagents.ollama-env"
 ```
 
-Then re-enable Ollama in System Settings → Login Items.
+Then quit and reopen Ollama (or re-enable it under **System Settings → General → Login Items**).
 
-**To remove:**
+### Verify
+
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.darkagents.ollama-env.plist
+# Should print: 0.0.0.0:11434
+launchctl getenv OLLAMA_HOST
+
+# Local check
+curl http://127.0.0.1:11434/api/tags
+
+# From another machine on the same LAN
+curl http://MAC_LAN_IP:11434/api/tags
+```
+
+Per [Ollama's FAQ](https://docs.ollama.com/faq#how-can-i-expose-ollama-on-my-network), the server binds to `127.0.0.1:11434` by default and is exposed on the network by setting `OLLAMA_HOST`.
+
+### Remove
+
+```bash
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.darkagents.ollama-env.plist
 rm ~/Library/LaunchAgents/com.darkagents.ollama-env.plist
+launchctl unsetenv OLLAMA_HOST
 ```
