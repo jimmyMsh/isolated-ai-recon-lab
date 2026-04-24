@@ -148,11 +148,17 @@ class ReportGenerator:
             f"and {service_count} identified service(s)."
         )
 
-        error_count = len(state.errors)
-        if error_count == 0:
-            sentence2 = "All pipeline stages completed successfully."
+        interrupted = any(e.get("reason") == "operator_interrupt" for e in state.errors)
+        if interrupted:
+            completed = len(state.stages_completed)
+            total = len(self._config.pipeline_stages)
+            sentence2 = f"Pipeline was interrupted after {completed} of {total} stages completed."
         else:
-            sentence2 = f"Pipeline completed with {error_count} failure/skip event(s)."
+            error_count = len(state.errors)
+            if error_count == 0:
+                sentence2 = "All pipeline stages completed successfully."
+            else:
+                sentence2 = f"Pipeline completed with {error_count} failure/skip event(s)."
 
         return f"## Executive Summary\n\n{sentence1} {sentence2}\n"
 
