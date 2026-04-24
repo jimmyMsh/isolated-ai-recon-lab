@@ -62,6 +62,9 @@ class ReconAgent(_PlanningMixin, _RuntimeMixin):
             try:
                 for stage in _PIPELINE_STAGES:
                     self._run_stage_with_budget(stage)
+            except KeyboardInterrupt:
+                self._log_run_interrupt()
+                raise
             except Exception as exc:
                 self._log_run_level_abort(exc)
         finally:
@@ -151,6 +154,36 @@ class ReconAgent(_PlanningMixin, _RuntimeMixin):
                 "reason": reason,
             },
             host_target=host,
+        )
+
+    def _log_run_interrupt(self) -> None:
+        """Record an operator SIGINT as a structured event and state.errors entry.
+
+        The error event is the durable JSONL record; the state.errors append
+        is what the report generator consumes for the Executive Summary
+        wording. Mirrors `_log_run_level_abort` but uses the
+        ``operator_interrupt`` reason and ``generate_partial_report`` action
+        so partial reports can describe the run accurately.
+        """
+        stage = self._state.current_stage or "unknown"
+        host = self._state.current_target
+        self._logger.log_event(
+            "error",
+            stage,
+            {
+                "error_type": "operator_interrupt",
+                "action_taken": "generate_partial_report",
+                "detail": "run interrupted by operator",
+            },
+            host_target=host,
+        )
+        self._state.errors.append(
+            {
+                "stage": stage,
+                "host": host,
+                "reason": "operator_interrupt",
+                "detail": "run interrupted by operator",
+            }
         )
 
     def _log_run_level_abort(self, exc: BaseException) -> None:
