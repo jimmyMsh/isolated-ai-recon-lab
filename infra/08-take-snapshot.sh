@@ -36,5 +36,13 @@ echo "Target:"
 virsh snapshot-list darkagents-target
 
 echo ""
-echo "To revert later:"
-echo "  virsh snapshot-revert <vm-name> <snapshot-name>"
+echo "=== Disk paths after snapshot ==="
+echo "Attacker:"
+virsh domblklist --details darkagents-attacker
+echo ""
+echo "Target:"
+virsh domblklist --details darkagents-target
+
+echo ""
+echo "Baseline snapshots created."
+echo "Use 'virsh snapshot-list <vm-name>' to confirm they exist."
